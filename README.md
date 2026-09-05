@@ -79,15 +79,21 @@ Memory Wizard（记忆之术）是一个 SillyTavern 第三方扩展，为角色
    SillyTavern/data/<你的用户名>/extensions/st-memory-wizzard/
    ```
    > 多数 SillyTavern 安装的 `<你的用户名>` 是 `default-user`。
-2. **安装服务端插件**（必须）：将本仓库里的 `backend` 文件夹，复制（或移动）到 SillyTavern 根目录的 `plugins` 文件夹下，并重命名为 `st-memory-wizzard`：
-   ```
-   SillyTavern/plugins/st-memory-wizzard/index.mjs
-   ```
+2. **安装服务端插件**（必须，否则所有请求都会 404）：
+   1. 在 SillyTavern 根目录的 `plugins` 文件夹下，新建一个名为 `st-memory-wizzard` 的子文件夹。
+   2. 把本仓库 `backend/` 文件夹里的 **`index.mjs`** 这个文件，复制到刚才新建的文件夹里。
+   3. 最终结果应该长这样（注意是 `index.mjs` 这个**文件**直接在该目录下，而不是再套一层 `backend/` 文件夹）：
+      ```
+      SillyTavern/plugins/st-memory-wizzard/index.mjs
+      ```
+      > ❌ 错误：`SillyTavern/plugins/st-memory-wizzard/backend/index.mjs`
+      > ✅ 正确：`SillyTavern/plugins/st-memory-wizzard/index.mjs`
 3. 确保你的 SillyTavern 配置（`config.yaml`）中开启了服务端插件功能：
    ```yaml
    enableServerPlugins: true
    ```
-4. 刷新（或重启）SillyTavern。
+4. **重启 SillyTavern 服务器进程**（关闭并重新启动整个程序，不是只刷新浏览器）。
+   > 服务端插件只在服务器启动时加载一次，浏览器刷新不会让它生效。
 5. 在顶栏点击 🧠 图标打开 Memory Wizard 面板。
 
 > **注意**：本扩展的后台持久化（保存记忆树/摘要/日志等）完全依赖服务端插件能力。若没有正确安装在 `plugins/st-memory-wizzard` 下，所有的网络请求都会报 404 连接异常。
