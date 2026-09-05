@@ -1266,6 +1266,201 @@ function getCacheDiagnostics(body, mode) {
     };
 }
 
+// ── 缓存前缀逐字节对比诊断 ──────────────────────────────────────────────
+// 每个模型保留最近一次 anthropic 上游请求的前缀快照（tools+system+messages 的
+// 扁平化文本 + 断点位置）。新请求进来时与上一次逐字节对比：
+//   • 前缀有分歧 → 报出第一个分歧的字节偏移、所在 path、前后文，直接定位是谁改了前缀；
+//   • 前缀逐字节一致但响应 usage 仍出现 creation → 说明上游缓存丢了
+//     （TTL 到期边缘 / 上游把请求路由到不同账号），本地无过错。
+// 结果写入 capture.gateway.prefixDiff；usage 到达后 evaluateCacheAnomaly()
+// 给出结论 capture.response.cacheAnomaly。快照仅存内存，不落盘。
+const lastPrefixSnapshots = new Map();
+const PREFIX_DIFF_CONTEXT_CHARS = 60;
+
+function getSegmentPlainText(segment) {
+    const value = segment.value;
+
+    if (typeof value === 'string') {
+        return value;
+    }
+
+    if (value && typeof value === 'object' && typeof value.text === 'string') {
+        return value.text;
+    }
+
+    return JSON.stringify(value ?? null);
+}
+
+function buildPrefixSnapshot(body) {
+    // tools 也参与缓存前缀（Anthropic 顺序：tools → system → messages）。
+    let flat = body?.tools ? JSON.stringify(body.tools) : '';
+    const segments = [];
+    const breakpoints = [];
+
+    for (const segment of getCacheSegments(body, 'anthropic')) {
+        const text = getSegmentPlainText(segment);
+        const role = segment.role ?? 'system';
+        const start = flat.length;
+        flat += `\u0000${role}\u0000${text}`;
+        segments.push({ path: segment.path, role, start, end: flat.length });
+
+        if (segment.cacheControl) {
+            breakpoints.push({ path: segment.path, endOffset: flat.length });
+        }
+    }
+
+    return { model: body?.model ?? null, flat, segments, breakpoints };
+}
+
+function findSegmentAtOffset(snapshot, offset) {
+    return snapshot.segments.find((segment) => offset >= segment.start && offset < segment.end) ?? null;
+}
+
+function diffPrefixSnapshots(prev, curr) {
+    const prevText = prev.flat;
+    const currText = curr.flat;
+    const minLength = Math.min(prevText.length, currText.length);
+    let firstDivergence = -1;
+
+    for (let i = 0; i < minLength; i++) {
+        if (prevText.charCodeAt(i) !== currText.charCodeAt(i)) {
+            firstDivergence = i;
+            break;
+        }
+    }
+
+    if (firstDivergence < 0 && prevText.length !== currText.length) {
+        firstDivergence = minLength;
+    }
+
+    const lastBreakpointOffset = curr.breakpoints.length > 0
+        ? curr.breakpoints[curr.breakpoints.length - 1].endOffset
+        : 0;
+    const identicalThroughLastBreakpoint = curr.breakpoints.length > 0
+        && (firstDivergence < 0 || firstDivergence >= lastBreakpointOffset);
+
+    const breakpoints = curr.breakpoints.map((breakpoint) => {
+        const bytesMatch = firstDivergence < 0 || breakpoint.endOffset <= firstDivergence;
+        const prevHasSameOffset = prev.breakpoints.some((p) => p.endOffset === breakpoint.endOffset);
+
+        return {
+            path: breakpoint.path,
+            endOffset: breakpoint.endOffset,
+            expected: bytesMatch && prevHasSameOffset ? 'hit' : 'miss',
+            bytesMatchPrev: bytesMatch,
+            prevHadBreakpointAtSameOffset: prevHasSameOffset,
+        };
+    });
+
+    let divergence = null;
+
+    if (firstDivergence >= 0 && firstDivergence < lastBreakpointOffset) {
+        const currSegment = findSegmentAtOffset(curr, firstDivergence);
+        const prevSegment = findSegmentAtOffset(prev, firstDivergence);
+        const from = Math.max(0, firstDivergence - PREFIX_DIFF_CONTEXT_CHARS);
+        const to = firstDivergence + PREFIX_DIFF_CONTEXT_CHARS;
+        divergence = {
+            offset: firstDivergence,
+            currPath: currSegment?.path ?? '(beyond-end)',
+            prevPath: prevSegment?.path ?? '(beyond-end)',
+            currContext: currText.slice(from, to),
+            prevContext: prevText.slice(from, to),
+        };
+    }
+
+    return {
+        identicalThroughLastBreakpoint,
+        firstDivergenceOffset: firstDivergence >= 0 ? firstDivergence : null,
+        lastBreakpointOffset,
+        prevLength: prevText.length,
+        currLength: currText.length,
+        breakpoints,
+        divergence,
+    };
+}
+
+function recordPrefixDiff(capture, body) {
+    try {
+        const snapshot = buildPrefixSnapshot(body);
+
+        if (snapshot.breakpoints.length === 0) {
+            return;
+        }
+
+        const prevEntry = lastPrefixSnapshots.get(snapshot.model);
+        const nowIso = new Date().toISOString();
+        lastPrefixSnapshots.set(snapshot.model, { snapshot, captureId: capture?.id ?? null, at: nowIso });
+
+        let diff = null;
+
+        if (prevEntry) {
+            diff = {
+                comparedToCaptureId: prevEntry.captureId,
+                comparedToAt: prevEntry.at,
+                ...diffPrefixSnapshots(prevEntry.snapshot, snapshot),
+            };
+        }
+
+        if (capture) {
+            capture.gateway.prefixDiff = diff ?? { comparedToCaptureId: null, note: 'first-request-for-model' };
+        }
+
+        if (!diff) {
+            log('PrefixDiff: 本模型首个请求，作为对比基线记录。', { model: snapshot.model, breakpoints: snapshot.breakpoints.length });
+        } else if (diff.identicalThroughLastBreakpoint) {
+            log(`PrefixDiff: 前缀与上次请求逐字节一致（到最后断点 offset=${diff.lastBreakpointOffset}），预期 ${diff.breakpoints.filter((b) => b.expected === 'hit').length}/${diff.breakpoints.length} 个断点命中。`);
+        } else if (diff.divergence) {
+            log(`PrefixDiff: 前缀在 offset=${diff.divergence.offset}（${diff.divergence.currPath}）处与上次分歧，其后的断点将重写。`, {
+                prevContext: diff.divergence.prevContext,
+                currContext: diff.divergence.currContext,
+            });
+        } else {
+            log('PrefixDiff: 断点数量或位置与上次不同（无共同前缀断点可比）。');
+        }
+    } catch (error) {
+        log('PrefixDiff diagnostics failed.', { error: error?.message });
+    }
+}
+
+function evaluateCacheAnomaly(capture) {
+    const usage = capture?.response?.usage;
+    const diff = capture?.gateway?.prefixDiff;
+
+    if (!usage || !diff || !Array.isArray(diff.breakpoints) || diff.breakpoints.length === 0) {
+        return;
+    }
+
+    // SSE 早期片段可能还没带上 anthropic usage 字段——等真值到了再判。
+    if (usage.anthropicCacheReadInputTokens == null && usage.anthropicCacheCreationInputTokens == null) {
+        return;
+    }
+
+    const read = usage.anthropicCacheReadInputTokens ?? 0;
+    const created = usage.anthropicCacheCreationInputTokens ?? 0;
+
+    let verdict = null;
+
+    if (created > 0 && diff.identicalThroughLastBreakpoint
+        && diff.breakpoints.every((breakpoint) => breakpoint.expected === 'hit')) {
+        verdict = 'upstream-cache-lost';
+    } else if (created > 0 && !diff.identicalThroughLastBreakpoint) {
+        verdict = 'prefix-changed';
+    } else if (created === 0 && read > 0) {
+        verdict = 'expected-hit';
+    }
+
+    if (verdict && capture.response.cacheAnomaly !== verdict) {
+        capture.response.cacheAnomaly = verdict;
+
+        if (verdict === 'upstream-cache-lost') {
+            log(`Cache anomaly: 前缀与上次请求字节级一致，上游仍重写缓存（read=${read}, creation=${created}）。本地无过错——多半是 TTL 到期边缘或上游把请求轮换到了别的账号/后端。`, { captureId: capture.id });
+        } else if (verdict === 'prefix-changed') {
+            const at = diff.divergence ? `offset=${diff.divergence.offset}（${diff.divergence.currPath}）` : '断点位置变化';
+            log(`Cache: 本次重写 creation=${created}，原因是前缀变了：${at}。详见 capture.gateway.prefixDiff。`, { captureId: capture.id });
+        }
+    }
+}
+
 function splitBodyAtFirstCacheControl(body, mode) {
     const segments = getCacheSegments(body, mode);
     const firstCacheIndex = segments.findIndex((segment) => segment.cacheControl);
@@ -1709,6 +1904,8 @@ function setCaptureResponse(capture, upstreamResponse, text = null, json = null)
         cacheResult: usage ? getCacheResultFromUsage(usage) : 'unknown',
         upstreamProvider,
     };
+
+    evaluateCacheAnomaly(capture);
 }
 
 function mergeCaptureUsage(capture, usage) {
@@ -1731,6 +1928,7 @@ function mergeCaptureUsage(capture, usage) {
 
     capture.response.usage = next;
     capture.response.cacheResult = getCacheResultFromUsage(next);
+    evaluateCacheAnomaly(capture);
 }
 
 function mergeCaptureUsageFromSseJson(capture, json, mode) {
@@ -1814,9 +2012,18 @@ function getAnthropicHeaders(request) {
     headers.set('anthropic-version', request.headers.get('anthropic-version') || process.env.ANTHROPIC_VERSION || '2023-06-01');
 
     const anthropicBeta = request.headers.get('anthropic-beta') || process.env.ANTHROPIC_BETA;
+    const betaTokens = anthropicBeta
+        ? anthropicBeta.split(',').map((token) => token.trim()).filter(Boolean)
+        : [];
 
-    if (anthropicBeta) {
-        headers.set('anthropic-beta', anthropicBeta);
+    // 1h TTL 官方要求 extended-cache-ttl beta 头；入站没带时自动补上，
+    // 避免上游把 ttl:'1h' 静默降级成 5m 或直接拒绝。
+    if (cacheTranslationEnabled && cacheTtl === '1h' && !betaTokens.includes('extended-cache-ttl-2025-04-11')) {
+        betaTokens.push('extended-cache-ttl-2025-04-11');
+    }
+
+    if (betaTokens.length > 0) {
+        headers.set('anthropic-beta', betaTokens.join(','));
     }
 
     applyUpstreamHeaderOverrides(headers);
@@ -2276,6 +2483,8 @@ async function proxyChatCompletionsAnthropic(request, body, convertedBody, resul
         mode: 'anthropic',
     });
 
+    recordPrefixDiff(capture, anthropicBody);
+
     const upstreamResponse = await fetch(upstreamUrl, {
         method: 'POST',
         headers: upstreamHeaders,
@@ -2401,6 +2610,8 @@ async function proxyAnthropicMessages(request) {
         body: convertedBody,
         mode: 'anthropic',
     });
+
+    recordPrefixDiff(capture, convertedBody);
 
     const upstreamResponse = await fetch(upstreamUrl, {
         method: 'POST',
@@ -2611,6 +2822,10 @@ function getCaptureSummary(capture) {
         cacheReadTokens: usage.anthropicCacheReadInputTokens ?? usage.cachedTokens ?? usage.cacheReadTokens ?? null,
         cacheWriteTokens: usage.anthropicCacheCreationInputTokens ?? usage.cacheWriteTokens ?? null,
         cacheResult: capture.response?.cacheResult ?? 'unknown',
+        cacheAnomaly: capture.response?.cacheAnomaly ?? null,
+        prefixDiffIdentical: capture.gateway?.prefixDiff?.identicalThroughLastBreakpoint ?? null,
+        prefixDiffDivergenceOffset: capture.gateway?.prefixDiff?.divergence?.offset ?? null,
+        prefixDiffDivergencePath: capture.gateway?.prefixDiff?.divergence?.currPath ?? null,
         responseStatus: capture.response?.status ?? null,
         prefixLockAction: capture.gateway?.prefixLock?.action ?? 'disabled',
         prefixLockReason: capture.gateway?.prefixLock?.reason ?? null,

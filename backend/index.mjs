@@ -136,12 +136,26 @@ const DEFAULT_CONFIG = {
     uiColor: "#a3842e",
     uiWidth: 90,
     uiHeight: 95,
+    sandboxMatchMode: "keyword",
     promptHistorical: `You are a professional historian. Your task is to merge and summarize the following numbered chat messages into a single historical summary (史记) of about 300 words.
 Focus on major character development, plot points, and the grand narrative arc. Output only the summarized text directly in Chinese, without any JSON format, codeblock markdown tags, or prefix/suffix.`,
     promptWeekly: `You are a professional chronicler. Your task is to merge and summarize the following numbered chat messages into a weekly summary (周记) of about 150-200 words.
 Focus on recent key interactions, character moods, and unresolved questions. Output only the summarized text directly in Chinese, without any JSON format, codeblock markdown tags, or prefix/suffix.`,
     promptRecap: `Write a storyline recap of the following numbered chat messages.
-Focus on the dramatic arc, conversation tone, and quick recap of recent events. Max 200 Chinese characters. Output only the recap text directly in Chinese, without any JSON format, codeblock markdown tags, or prefix/suffix.`
+Focus on the dramatic arc, conversation tone, and quick recap of recent events. Max 200 Chinese characters. Output only the recap text directly in Chinese, without any JSON format, codeblock markdown tags, or prefix/suffix.`,
+    // ── 世界书面板（World Book）── 镜像前端 config 默认值。
+    wbProfile: "",
+    wbMultiProfile: "",
+    wbPromptReduce: "",
+    wbPromptComplete: "",
+    wbPromptRewrite: "",
+    wbPromptMulti: "",
+    wbAllowChangeExisting: false,
+    wbAllowAddNew: false,
+    wbAllowDeleteMerge: false,
+    wbSelectedBook: "",
+    wbLastSingleMode: "reduce",
+    wbFollowCharBook: true
 };
 
 /**

@@ -118,6 +118,9 @@ let config = {
     recapProfile: "",       // 日记自动生成
     weeklyProfile: "",      // 周记自动 fuse
     historicalProfile: "",  // 史记自动 fuse
+    // 全局兜底：任一任务 profile 调用失败（额度耗尽/密钥失效/超时）时先用它重试一次，
+    // 它也失败才回退到酒馆激活 API。空=保持旧行为（直接回退激活 API）。
+    fallbackProfile: "",
     macroMemory: "memory_tree",
     macroTreeHeader: "memory_tree_header",
     macroHistorical: "memory_historical",
@@ -150,6 +153,7 @@ let config = {
     sandboxPageSize: 100,
     sandboxRegex: "",
     sandboxKeyword: "",
+    sandboxMatchMode: "keyword",
     shijiRegex: "",            // legacy single-regex; migrated into shijiRules on load
     shijiMode: 'uncovered',    // 时记 floor selection: 'fixed' | 'uncovered'
     shijiKeepFloors: 0,        // 始终保持X楼：始终至少保留最近 X 楼正文（即使已被日记/周记/史记覆盖），防刚总结完无正文参照导致角色偏移。0=关闭
@@ -161,6 +165,7 @@ let config = {
     shijiRules: [],            // [{ regex, posMin|null, posMax|null, role:'ai'|'user'|'both' }]
     summaryDefaultShowRealTime: false, // 新建日记/周记/史记默认开启蓝色小时钟（现实时间注入）
     fakeChatHistory: false,         // 伪造成聊天历史：用 setExtensionPrompt(IN_CHAT) 把记忆插进 user 消息前，并计入 Itemization
+    fakeChatHistoryIncludeSummaries: false, // 伪造历史时，将史记/周记/日记合成一条 assistant 消息
     // Saved match-mode templates: [{ name, filters:[...], keyword, regex }]. The
     // active one drives both the editor view and {{history}}.
     matchTemplates: [],
@@ -177,6 +182,9 @@ let config = {
     // Auto-fusion thresholds: how many lower records merge into one higher record.
     RECAP_TO_WEEKLY: 10,      // N daily(recap) -> 1 weekly
     WEEKLY_TO_HISTORICAL: 5,  // N weekly -> 1 historical
+    recapKeepLatest: 0,       // 日记：触发周记融合时始终保留最新X条日记不参与本次融合（防融合后近期细节骤减）。0=关闭
+    weeklyKeepLatest: 0,      // 周记：触发史记融合时始终保留最新X条周记不参与本次融合。0=关闭
+    keepLatestInclusive: false, // 保留条数是否算在融合阈值内。false=外加(5+2→攒7融5)，true=包含(5含2→攒5融3)
     // 直融旁路：队尾连续未覆盖楼 ≥ 阈值时，跳过中间层直接融成 1 条周记/史记。
     // 优先级 史记 > 周记 > 日记。默认 0 = 关（走原日记 cascade 路径，零行为变化）。
     // 触发后取队尾未覆盖段最早「阈值」条楼融成 1 条，覆盖后这批退出未覆盖集合，剩余积压留后续。
@@ -213,7 +221,20 @@ Focus on the dramatic arc, conversation tone, and quick recap of recent events. 
     anthropicCacheMinChars: 1200,
     anthropicCacheDebug: false,
     anthropicCacheAiExplain: false,
-    anthropicCacheTestMode: 'recommend'
+    anthropicCacheTestMode: 'recommend',
+    // ── 世界书面板（World Book）──
+    wbProfile: "",                 // 单条 AI 连接配置
+    wbMultiProfile: "",            // 多条 AI 连接配置
+    wbPromptReduce: "",            // 单条·缩减 prompt（空=内置默认）
+    wbPromptComplete: "",          // 单条·补全 prompt
+    wbPromptRewrite: "",           // 单条·重构 prompt
+    wbPromptMulti: "",             // 多条修改 prompt
+    wbAllowChangeExisting: false,  // 多条：允许修改已有条目
+    wbAllowAddNew: false,          // 多条：允许新增条目
+    wbAllowDeleteMerge: false,     // 多条：允许删除/合并已有条目
+    wbSelectedBook: "",            // 上次选择的世界书名
+    wbLastSingleMode: "reduce",    // 单条模式当前预设 reduce/complete/rewrite
+    wbFollowCharBook: true         // 跟随角色卡绑定世界书
 };
 
 // ── Built-in default prompts (single source of truth) ──
@@ -484,7 +505,7 @@ let lastMainPromptCacheSnapshotMeta = null;
 // (pixiv-style removable chips). 'size' is a sort directive, the rest filter.
 let sandboxFilters = [];
 // The current match mode selected in the dropdown (what a new tag will be).
-let sandboxMatchMode = 'regex';
+let sandboxMatchMode = 'keyword';
 // The last compiled {{history}} block (full matched context window). Exposed via
 // the {{history}} macro for external callers.
 let lastCompiledHistory = "";
@@ -2695,6 +2716,12 @@ function focusNodeEditorIfMobile() {
     requestAnimationFrame(() => panel.scrollIntoView({ block: 'start', behavior: 'smooth' }));
 }
 
+function focusWbPanelIfMobile() {
+    const panel = document.getElementById('wizard-wb-panel');
+    if (!panel || !window.matchMedia('(max-width: 768px), (pointer: coarse)').matches) return;
+    requestAnimationFrame(() => panel.scrollIntoView({ block: 'start', behavior: 'smooth' }));
+}
+
 function loadNodeIntoForm(node, opts = {}) {
     if (!opts.keepDraft) beginNodeEditDraft(node);
     $('#wizard-node-original-path').val(node.path);
@@ -3199,6 +3226,12 @@ function sumText(item) {
 function sumIsArchived(item) {
     return typeof item === 'object' && item !== null && !!item.archived;
 }
+// 「始终保留最新X条」包含模式的标记：内容已经融进上层记录，但暂缓归档、继续留在本层
+// 供近期参照。带此标记的条目不再参与后续融合（否则上层会出现重复内容），下一轮融合
+// 成功后统一归档。
+function sumIsFusedKeep(item) {
+    return typeof item === 'object' && item !== null && !!item.fusedKeep;
+}
 function sumSource(item) {
     return (typeof item === 'object' && item !== null && item.source) ? item.source : "";
 }
@@ -3245,6 +3278,10 @@ function sumSetText(arr, i, text) {
 function sumSetArchived(arr, i, archived) {
     if (typeof arr[i] === 'string') arr[i] = { text: arr[i], archived };
     else arr[i] = { ...arr[i], archived };
+}
+function sumSetFusedKeep(arr, i, fusedKeep) {
+    if (typeof arr[i] === 'string') arr[i] = { text: arr[i], fusedKeep };
+    else arr[i] = { ...arr[i], fusedKeep };
 }
 function sumSetName(arr, i, name) {
     if (typeof arr[i] === 'string') arr[i] = { text: arr[i], name };
@@ -4041,8 +4078,8 @@ function syncFakeChatRegex() {
     }
 }
 
-// 在 GENERATION_AFTER_COMMANDS 触发：把时记 + 史记/周记/日记用 setExtensionPrompt(IN_CHAT)
-// 注入成「真实对话历史」——插在当前 user 消息之前，归入 Itemization 的 Chat History 桶。
+// 在 GENERATION_AFTER_COMMANDS 触发：把时记（可选再加一条合并的分层摘要）用
+// setExtensionPrompt(IN_CHAT) 注入成「真实对话历史」——插在当前 user 消息之前，归入 Itemization 的 Chat History 桶。
 function injectMemoryAsHistory(type) {
     const ctx = window.SillyTavern?.getContext();
     const setEP = ctx?.setExtensionPrompt;
@@ -4108,8 +4145,16 @@ function injectMemoryAsHistory(type) {
         const raw = String(config.anthropicCacheRollingDepths ?? '').trim();
         if (raw) {
             raw.split(/[,，\s]+/).filter(Boolean).forEach((tok) => {
-                const idx = parseInt(tok, 10);
-                if (Number.isInteger(idx) && idx >= 0 && idx < ordered.length && rollingSet.size < 3) {
+                let idx = parseInt(tok, 10);
+                if (!Number.isInteger(idx) || idx < 0) return;
+                // 时记楼数量不足（如日记刚归档、窗口塌缩）时退化到最深可用楼，
+                // 而不是无声丢弃——否则滚动断点会静默消失，请求里只剩固定锚点。
+                if (idx >= ordered.length) {
+                    const fallback = ordered.length - 1;
+                    writeLog(`滚动缓存：配置深度 ${idx}（倒数第 ${idx + 1} 楼）超出当前时记楼数量 ${ordered.length}，退化为最深可用楼（倒数第 ${fallback + 1} 楼）。`, 'WARN');
+                    idx = fallback;
+                }
+                if (rollingSet.size < 3) {
                     rollingSet.add(idx);
                 }
             });
@@ -4135,16 +4180,22 @@ function injectMemoryAsHistory(type) {
         depth++;
     });
 
-    // 注：史记/周记/日记不再由伪造历史注入（曾经的 step 2.5 分隔轮 + step 3 融合段已移除）。
-    //   现在的分工：
-    //     • 伪造历史（本函数）只负责「时记」——逐楼注入成 IN_CHAT 对话轮，归入 Chat History 桶。
-    //     • 史记/周记/日记由用户在 preset 里用 {{memory}} 宏作为 system prompt 调用，归 extension/系统桶。
-    //   这样 Chat History 桶 = 只含时记（用户要的语义分类），且史记走 system 是 Anthropic 缓存最自然的位置。
-    //   cache 断点：固定点由 preset 里的 {{cache_anchor}}（放在 {{memory}} 与最近楼层之间）控制；
-    //   滚动点由上面 step 2 的 anthropicCacheRollingDepths 在时记楼末尾追加 [[CACHE_BREAK]] 实现。
+    // 3) 可选：将全部未归档的史记/周记/日记合成一条更早的 assistant 消息。
+    // depth 必须在时记之后，保证这条总览位于时记之前而不是贴着当前 user 消息。
+    if (config.fakeChatHistoryIncludeSummaries) {
+        const content = compileAllRecords();
+        if (content) {
+            const key = 'stmw_layered_summaries';
+            try {
+                setEP(key, content, EP_TYPE_IN_CHAT, depth, false, EP_ROLE_ASSISTANT);
+                registeredInjectKeys.add(key);
+                depth++;
+            } catch (e) { /* ignore */ }
+        }
+    }
 
     if (registeredInjectKeys.size) {
-        writeLog(`伪造聊天历史(IN_CHAT)：注入 ${ordered.length} 段时记楼为对话轮次（史记/周记/日记不再由伪造历史注入，改由 preset {{memory}} 作 system）。`);
+        writeLog(`伪造聊天历史(IN_CHAT)：注入 ${ordered.length} 段时记楼${config.fakeChatHistoryIncludeSummaries ? '，并将史记/周记/日记合并为 1 条 assistant 消息' : ''}。`);
     }
 }
 
@@ -4367,7 +4418,7 @@ function commitRecapPreRegexRules() {
 // omitShiji=true：把 {{memory_hourly}}（时记）宏置空。用于伪造聊天历史模式——
 // 那里时记已由 injectMemoryAsHistory 逐楼注入成独立对话轮次，若模板里还含时记宏
 // 会导致时记在这一整段 system 里重复出现，所以置空避免双重注入。
-function compileFusionMemory(omitShiji = false) {
+function compileFusionMemory(omitShiji = false, omitLayeredSummaries = false) {
     let template = config.fusionTemplate;
     if (template === undefined || template === null) {
         template = `{{${config.macroHistorical || 'memory_historical'}}}\n\n{{${config.macroTreeHeader || 'memory_tree_header'}}}`;
@@ -4376,9 +4427,9 @@ function compileFusionMemory(omitShiji = false) {
     // Archived summary items are excluded from injection. Each record carries its
     // 【名字 | RP时间 | 现实时间】 header via formatRecordForInject.
     const activeText = (arr) => (arr || []).filter(x => !sumIsArchived(x)).map(formatRecordForInject);
-    const historicalVal = activeText(summaries.historicalSummaries).join('\n\n');
-    const weeklyVal = activeText(summaries.weeklySummaries).join('\n\n');
-    const recapVal = activeText(summaries.recaps).join('\n');
+    const historicalVal = omitLayeredSummaries ? '' : activeText(summaries.historicalSummaries).join('\n\n');
+    const weeklyVal = omitLayeredSummaries ? '' : activeText(summaries.weeklySummaries).join('\n\n');
+    const recapVal = omitLayeredSummaries ? '' : activeText(summaries.recaps).join('\n');
     const treeHeaderVal = compileMemoryTreeNames();
     const treeVal = compileMemoryTreeMacroValue();
     const shijiVal = omitShiji ? "" : compileShiji();
@@ -4673,7 +4724,7 @@ function registerCustomMacros() {
                 //     {{memory}} 只出史记/周记/日记，避免时记被注入两遍。
                 //   • 伪造历史关：无逐楼注入 → omitShiji=false，{{memory}} 含时记（传统行为）。
                 // 包一层箭头函数，忽略宏引擎传入的任何参数，只读 config.fakeChatHistory。
-                registerMacroFn(config.macroFusion, () => compileFusionMemory(!!config.fakeChatHistory), 'Memory Wizard: 融合记忆 (史记/周记/日记/记忆树索引；伪造历史开时省略时记，时记走逐楼注入)');
+                registerMacroFn(config.macroFusion, () => compileFusionMemory(!!config.fakeChatHistory, !!(config.fakeChatHistory && config.fakeChatHistoryIncludeSummaries)), 'Memory Wizard: 融合记忆 (伪造历史开时省略时记；分层摘要合并开时也省略史记/周记/日记)');
             }
             if (SlashCommand && SlashCommandParser) {
                 if (SlashCommandParser.commands[config.macroFusion]) {
@@ -4747,6 +4798,71 @@ function registerCustomMacros() {
 // ══════════════════════════════════════════════════════════════════════
 let wizardLoadingConfig = false;
 
+// ── 世界书面板（World Book）顶层状态与内置默认 Prompt ──
+// 放在顶层作用域，使 loadConfig/saveConfig（顶层函数）与 WB 事件处理函数
+// （registerNodeFormListeners 内的嵌套函数）都能访问。
+const DEFAULT_WB_PROMPT_REDUCE = `你是世界书条目精简器。请精简下方条目的正文，保留核心设定/事实，删除冗余、重复与不必要细节，不编造新事实。
+条目标题: {{entry_title}}
+触发关键词: {{entry_keys}}
+当前正文:
+{{entry_content}}
+只输出精简后的新正文，不要解释、不要 markdown、不要 JSON。`;
+
+const DEFAULT_WB_PROMPT_COMPLETE = `你是世界书条目补全器。请根据下方条目现有正文与上下文，补全/扩写缺失的设定细节，使其更完整、更自洽，不与已有事实矛盾、不编造与角色卡冲突的设定。
+条目标题: {{entry_title}}
+触发关键词: {{entry_keys}}
+当前正文:
+{{entry_content}}
+只输出补全后的新正文，不要解释、不要 markdown、不要 JSON。`;
+
+const DEFAULT_WB_PROMPT_REWRITE = `你是世界书条目重构器。请用更高级、更细腻、更具文学性的方式重写下方条目的正文，保留全部核心事实与设定不变，提升表达质感与可读性，不编造新事实。
+条目标题: {{entry_title}}
+触发关键词: {{entry_keys}}
+当前正文:
+{{entry_content}}
+只输出重构后的新正文，不要解释、不要 markdown、不要 JSON。`;
+
+const DEFAULT_WB_PROMPT_MULTI = `请整理下方世界书：合并重复/相似的条目、补充明显缺失的设定细节、删除冗余或矛盾条目，使世界书更精炼自洽，不编造与角色卡冲突的事实。
+
+当前世界书（含正文）:
+{{world_book_full}}
+
+只输出可由插件执行的 JSON 操作数组，不要 markdown，不要解释，不要代码块。每个元素一条操作：
+[
+  {"op":"update","uid":0,"fields":{"content":"新正文","comment":"可选新标题","key":["关键词"]}},
+  {"op":"add","fields":{"comment":"新条目标题","content":"新正文","key":["触发词"],"constant":false,"selective":true,"order":100,"position":0,"disable":false}},
+  {"op":"delete","uid":1},
+  {"op":"merge","sourceUid":2,"targetUid":3}
+]
+操作规则：
+- update：修改已有条目。uid 必须存在。fields 里只放需要改的字段（content/comment/key/keysecondary/constant/selective/order/position/disable 等），未列出的字段保留原值。
+- add：新增条目。必须有 comment 与 content；key 默认 []、constant 默认 false、selective 默认 true、order 默认 100、position 默认 0、disable 默认 false。
+- delete：删除已有条目。uid 必须存在。
+- merge：把 sourceUid 条目并入 targetUid 条目（正文拼接、关键词合并），然后删除 sourceUid。两者必须都存在且不同。
+- 仅输出确实需要的操作；未授权的操作会被插件丢弃，不要输出。`;
+
+const WB_SINGLE_SYSTEM_PROMPT = `你是世界书条目编辑器。根据用户指令与给定的条目内容，输出该条目修改后的结果。
+输出规则：
+- 默认只输出修改后的新正文（纯文本，不要 markdown、不要解释、不要 JSON）。
+- 若需要同时修改标题/关键词等字段，可输出一个 JSON 对象，如 {"content":"新正文","comment":"新标题","key":["词1","词2"]}，插件会据此合并字段。
+- 不要编造用户没有给出的事实；保留核心设定。`;
+
+const WB_MULTI_SYSTEM_PROMPT = `你是世界书整理器。只输出 JSON 操作数组，不要 markdown、不要解释、不要代码块。严格按用户指令与授权开关操作；未授权的操作不要输出。`;
+
+const WB_OP_FIELDS = ['content','comment','key','keysecondary','constant','selective','selectiveLogic','order','position','disable','vectorized','addMemo','probability','useProbability','depth','role','group','groupWeight','groupOverride','sticky','cooldown','delay','triggers','automationId','preventRecursion','excludeRecursion','delayUntilRecursion','matchPersonaDescription','matchCharacterDescription','matchCharacterPersonality','matchCharacterDepthPrompt','matchScenario','matchCreatorNotes','scanDepth','caseSensitive','matchWholeWords','useGroupScoring','ignoreBudget'];
+
+let wbCache = null;            // { name, data, ts }
+let wbSelectedBook = "";       // 当前选择的世界书名
+let wbSelectedUid = null;      // 单条模式当前目标 uid
+let wbMultiSelectedUids = new Set(); // 多条模式勾选的 uid
+let wbLastSnapshot = null;     // { name, data } 应用前快照，用于一键撤回
+let wbAbortController = null;  // AI 请求中止器
+let wbStreamMode = 'single';   // 当前流式输出归属：'single' | 'multi'
+let wbPendingOps = new Map();  // multi 模式待确认操作：key -> op
+let wbLastSingleMode = 'reduce'; // 单条模式当前预设
+let wbOverflowObserver = null; // 世界书面板溢出监听器
+let _wbTokenSeq = 0;           // token 统计序号，防过期覆盖
+
 async function loadConfig() {
     wizardLoadingConfig = true;
     try {
@@ -4782,12 +4898,15 @@ async function loadConfig() {
             '#wizard-recap-profile',
             '#wizard-weekly-profile',
             '#wizard-historical-profile',
+            '#wizard-fallback-profile',
             '#wizard-fusion-profile',
             '#wizard-ai-shrink-profile',
             '#wizard-scene-teaching-profile',
             '#wizard-scene-plot-profile',
             '#wizard-scene-intimate-profile',
             '#wizard-gateway-profile',
+            '#wizard-wb-profile',
+            '#wizard-wb-multi-profile',
         ];
         profileSelectorIds.forEach(sel => {
             const $sel = $(sel);
@@ -4829,6 +4948,7 @@ async function loadConfig() {
         $('#wizard-recap-profile').val(config.recapProfile || "");
         $('#wizard-weekly-profile').val(config.weeklyProfile || "");
         $('#wizard-historical-profile').val(config.historicalProfile || "");
+        $('#wizard-fallback-profile').val(config.fallbackProfile || "");
         $('#wizard-fusion-profile').val(config.fusionProfile !== undefined ? config.fusionProfile : "");
         // Restore sticky fusion-panel settings, then sync the source-dependent
         // visibility (floors-only vs records-only) via a change trigger.
@@ -4857,6 +4977,9 @@ async function loadConfig() {
         // These inputs now represent record-count fusion thresholds.
         $('#wizard-n-merge').val(config.RECAP_TO_WEEKLY !== undefined ? config.RECAP_TO_WEEKLY : 10);
         $('#wizard-n-melon').val(config.WEEKLY_TO_HISTORICAL !== undefined ? config.WEEKLY_TO_HISTORICAL : 5);
+        $('#wizard-recap-keep-latest').val(Math.max(0, parseInt(config.recapKeepLatest) || 0));
+        $('#wizard-weekly-keep-latest').val(Math.max(0, parseInt(config.weeklyKeepLatest) || 0));
+        renderKeepLatestToggle();
         $('#wizard-n-shiji').val(config.N_SHIJI);
         $('#wizard-k-recall').val(config.K_RECALL);
         $('#wizard-token-cap').val(config.TOKEN_CAP);
@@ -4893,6 +5016,9 @@ async function loadConfig() {
         $('#wizard-sandbox-page-size').val(config.sandboxPageSize !== undefined ? config.sandboxPageSize : 100);
         $('#wizard-sandbox-regex').val(config.sandboxRegex || '');
         $('#wizard-sandbox-keyword').val(config.sandboxKeyword || '');
+        $('#wizard-sandbox-match-mode').val(config.sandboxMatchMode || 'keyword');
+        if (!$('#wizard-sandbox-match-mode').val()) $('#wizard-sandbox-match-mode').val('keyword');
+        $('#wizard-sandbox-match-mode').trigger('change');
         // 时记 multi-rule migration: seed a single 'both' rule from the legacy
         // single regex if no rules exist yet, then bind the mode + rule list UI.
         if (!Array.isArray(config.shijiRules)) config.shijiRules = [];
@@ -4919,6 +5045,7 @@ async function loadConfig() {
         $('#wizard-shiji-show-date-user').prop('checked', !!config.shijiShowDateUser);
         $('#wizard-shiji-show-model').prop('checked', !!config.shijiShowModel);
         $('#wizard-fake-chat-history').prop('checked', !!config.fakeChatHistory);
+        $('#wizard-fake-chat-history-summaries').prop('checked', !!config.fakeChatHistoryIncludeSummaries);
         renderShijiRules();
         $('#wizard-fusion-include-preset').attr('data-active', config.fusionIncludePreset ? 'true' : 'false');
 
@@ -4942,6 +5069,25 @@ async function loadConfig() {
         if (!$('#wizard-ai-shrink-prompt').val()) {
             $('#wizard-ai-shrink-prompt').val(config.aiShrinkPrompt || "");
         }
+
+        // 世界书面板：恢复选择/配置到 UI（不触发 change，避免递归保存）。
+        $('#wizard-wb-profile').val(config.wbProfile || "");
+        $('#wizard-wb-multi-profile').val(config.wbMultiProfile || "");
+        $('#wizard-wb-follow-char').prop('checked', config.wbFollowCharBook !== false);
+        wbSelectedBook = config.wbSelectedBook || "";
+        wbLastSingleMode = config.wbLastSingleMode || 'reduce';
+        $('.wizard-wb-preset').removeClass('wizard-wb-preset-active');
+        $(`.wizard-wb-preset[data-mode="${wbLastSingleMode}"]`).addClass('wizard-wb-preset-active');
+        $('#wizard-wb-allow-change').attr('data-active', String(!!config.wbAllowChangeExisting));
+        $('#wizard-wb-allow-add').attr('data-active', String(!!config.wbAllowAddNew));
+        $('#wizard-wb-allow-delete-merge').attr('data-active', String(!!config.wbAllowDeleteMerge));
+        {
+            const m = wbLastSingleMode;
+            const def = m === 'reduce' ? DEFAULT_WB_PROMPT_REDUCE : m === 'complete' ? DEFAULT_WB_PROMPT_COMPLETE : DEFAULT_WB_PROMPT_REWRITE;
+            const saved = config[`wbPrompt${m.charAt(0).toUpperCase() + m.slice(1)}`] || "";
+            $('#wizard-wb-single-prompt').val(saved || def);
+        }
+        $('#wizard-wb-multi-prompt').val(config.wbPromptMulti || DEFAULT_WB_PROMPT_MULTI);
 
         // Apply theme, modal size, and custom macros
         applyThemeColor();
@@ -5052,6 +5198,7 @@ async function saveConfig(silent = false) {
     config.recapProfile = $('#wizard-recap-profile').val() || "";
     config.weeklyProfile = $('#wizard-weekly-profile').val() || "";
     config.historicalProfile = $('#wizard-historical-profile').val() || "";
+    config.fallbackProfile = $('#wizard-fallback-profile').val() || "";
     // Scene-based main-reply profile switch.
     config.sceneSwitchEnabled = $('#wizard-scene-switch-enabled').prop('checked');
     config.sceneTeachingProfile = $('#wizard-scene-teaching-profile').val() || "";
@@ -5090,6 +5237,9 @@ async function saveConfig(silent = false) {
     // The 周记/史记 inputs now drive the record-count fusion thresholds.
     config.RECAP_TO_WEEKLY = Math.max(2, parseInt($('#wizard-n-merge').val()) || 10);
     config.WEEKLY_TO_HISTORICAL = Math.max(2, parseInt($('#wizard-n-melon').val()) || 5);
+    config.recapKeepLatest = Math.max(0, parseInt($('#wizard-recap-keep-latest').val()) || 0);
+    config.weeklyKeepLatest = Math.max(0, parseInt($('#wizard-weekly-keep-latest').val()) || 0);
+    config.keepLatestInclusive = $('#wizard-keep-latest-inclusive').attr('data-active') === 'true';
     config.N_SHIJI = parseInt($('#wizard-n-shiji').val()) || 20;
     config.K_RECALL = parseInt($('#wizard-k-recall').val()) || 5;
     config.TOKEN_CAP = parseInt($('#wizard-token-cap').val()) || 8000;
@@ -5126,12 +5276,30 @@ async function saveConfig(silent = false) {
     config.sandboxPageSize = Math.max(10, Math.min(1000, parseInt($('#wizard-sandbox-page-size').val()) || 100));
     config.sandboxRegex = $('#wizard-sandbox-regex').val() || "";
     config.sandboxKeyword = $('#wizard-sandbox-keyword').val() || "";
+    config.sandboxMatchMode = $('#wizard-sandbox-match-mode').val() || 'keyword';
     // config.shijiRules / config.shijiMode are mutated live by the rule handlers
     // (same pattern as sandboxFilters), so no DOM read is needed here. The legacy
     // config.shijiRegex is kept untouched as a migration source.
 
     config.aiShrinkProfile = $('#wizard-ai-shrink-profile').val() || "";
     config.aiShrinkPrompt = $('#wizard-ai-shrink-prompt').val() || "";
+    // 世界书面板：读回表单到 config。
+    config.wbProfile = $('#wizard-wb-profile').val() || "";
+    config.wbMultiProfile = $('#wizard-wb-multi-profile').val() || "";
+    config.wbFollowCharBook = $('#wizard-wb-follow-char').prop('checked');
+    config.wbSelectedBook = wbSelectedBook || "";
+    config.wbLastSingleMode = wbLastSingleMode || 'reduce';
+    const _wbNorm = (v, def) => { const s = (v || '').trim(); return (!s || s === def.trim()) ? "" : s; };
+    // 单条 prompt 文本框只承载当前预设的模板，仅对当前预设做 norm。
+    {
+        const m = wbLastSingleMode;
+        const def = m === 'reduce' ? DEFAULT_WB_PROMPT_REDUCE : m === 'complete' ? DEFAULT_WB_PROMPT_COMPLETE : DEFAULT_WB_PROMPT_REWRITE;
+        config[`wbPrompt${m.charAt(0).toUpperCase() + m.slice(1)}`] = _wbNorm($('#wizard-wb-single-prompt').val(), def);
+    }
+    config.wbPromptMulti = _wbNorm($('#wizard-wb-multi-prompt').val(), DEFAULT_WB_PROMPT_MULTI);
+    config.wbAllowChangeExisting = $('#wizard-wb-allow-change').attr('data-active') === 'true';
+    config.wbAllowAddNew = $('#wizard-wb-allow-add').attr('data-active') === 'true';
+    config.wbAllowDeleteMerge = $('#wizard-wb-allow-delete-merge').attr('data-active') === 'true';
     config.anthropicCacheEnabled = $('#wizard-anthropic-cache-enabled').prop('checked');
     config.anthropicCacheScope = $('#wizard-anthropic-cache-scope').val() || 'internal';
     config.anthropicCacheProviderMode = $('#wizard-anthropic-cache-provider-mode').val() || 'auto';
@@ -5587,11 +5755,14 @@ function updateSummaryProgress() {
     // 日记触发阈值用「最低未覆盖楼层数」(config.morningMinFloors),与下方队尾日记
     // 真实触发条件一致;N_RECAP 只决定一次融多少(批量),不参与触发门槛。
     const nRecap = Math.max(1, parseInt(config.morningMinFloors) || 30);
-    const r2w = parseInt(config.RECAP_TO_WEEKLY) || 10;
-    const w2h = parseInt(config.WEEKLY_TO_HISTORICAL) || 5;
+    // 进度条终点 = keepLatestPlan 算出的实际触发门槛，与 runCascadeFusionOnce 保持一致。
+    const r2w = keepLatestPlan(parseInt(config.RECAP_TO_WEEKLY) || 10, parseInt(config.recapKeepLatest) || 0).trigger;
+    const w2h = keepLatestPlan(parseInt(config.WEEKLY_TO_HISTORICAL) || 5, parseInt(config.weeklyKeepLatest) || 0).trigger;
 
-    const recapCount = countActive(summaries.recaps);
-    const weeklyCount = countActive(summaries.weeklySummaries);
+    // 进度条计数用「可融条目」而非全部未归档条目：包含模式下 fusedKeep 条目虽然还显示在
+    // 本层，但内容已进上层、不再参与融合，计入进度条会让进度虚高、与真实触发点错位。
+    const recapCount = fusableSummaryIndices(summaries.recaps).length;
+    const weeklyCount = fusableSummaryIndices(summaries.weeklySummaries).length;
     const historicalCount = countActive(summaries.historicalSummaries);
 
     // 日记触发计数 = 「队尾连续未覆盖段」长度(tailUncoveredRun),与真实触发条件一致:
@@ -5757,6 +5928,21 @@ async function runProfileLlmCall(profileName, messages, systemPrompt = "", tempe
             throw e; // Propagate abort directly without falling back
         }
         if (noFallback) throw e;
+
+        // 兜底优先级：配置的回退 profile > 酒馆激活 API。激活 API 通常是主力大模型，
+        // 一次日记调用能把十万 token 的上下文按原价打进去（见 usages id=184）。回退 profile
+        // 用 noFallback=true 调用，保证最多下探一层，不会递归。
+        const fallbackName = (config.fallbackProfile || "").trim();
+        if (fallbackName && fallbackName !== profileName) {
+            try {
+                writeLog(`Profile "${profileName}" fetch failed (${e.message}). Retrying with fallback profile "${fallbackName}".`, 'WARNING');
+                return await runProfileLlmCall(fallbackName, messages, systemPrompt, temperature, timeoutMs, abortSignal, disableThinking, true, skipCache);
+            } catch (fe) {
+                if (fe.name === 'AbortError' || (abortSignal && abortSignal.aborted)) throw fe;
+                writeLog(`Fallback profile "${fallbackName}" also failed: ${fe.message}. Falling back to SillyTavern active API.`, 'WARNING');
+            }
+        }
+
         // Fallback: If profile config fails, use the active LLM of SillyTavern itself
         writeLog(`Profile "${profileName}" fetch failed. Falling back to SillyTavern active API. Error: ${e.message}`, 'WARNING');
 
@@ -6581,7 +6767,7 @@ Return "知识/德国观念论/康德".
                 const fusionMacro = config.macroFusion || 'memory';
                 if (msg[contentKey].includes(`{{${fusionMacro}}}`)) {
                     const phRegex = new RegExp(`\\{\\{${fusionMacro}\\}\\}`, 'g');
-                    const fusionOut = compileFusionMemory(!!config.fakeChatHistory);
+                    const fusionOut = compileFusionMemory(!!config.fakeChatHistory, !!(config.fakeChatHistory && config.fakeChatHistoryIncludeSummaries));
                     msg[contentKey] = msg[contentKey].replace(phRegex, fusionOut);
                     placeholderSubstituted = true;
                     fusionPlaceholderFound = true;
@@ -7290,8 +7476,34 @@ async function maybeRunMorningRecap(triggerFloor) {
     return true;
 }
 
-function activeSummaryIndices(arr) {
-    return (arr || []).map((x, i) => ({ x, i })).filter(o => !sumIsArchived(o.x)).map(o => o.i);
+// 可参与融合的条目：未归档、且不是「包含模式」留下的 fusedKeep 条目（那些内容已经在
+// 上层了，再融一次会让上层出现重复内容）。外加模式下从不产生 fusedKeep，等价于「未归档」。
+function fusableSummaryIndices(arr) {
+    return (arr || []).map((x, i) => ({ x, i }))
+        .filter(o => !sumIsArchived(o.x) && !sumIsFusedKeep(o.x)).map(o => o.i);
+}
+
+// 「始终保留最新X条」的两种语义，由 config.keepLatestInclusive 切换。
+// 返回 { trigger, take, keepActive }：可融条目攒够 trigger 条时触发，融最早的 take 条，
+// 其中最新的 keepActive 条融完后暂不归档、以 fusedKeep 身份继续留在本层。
+//   外加 (false, 默认)：保留的 keep 条不参与总结 → 攒 threshold+keep 条，只融最早 threshold 条，
+//     最新 keep 条压根没进过融合，原样留着，等下一轮再融。keep=0 时与改动前行为完全一致。
+//   包含 (true)：保留的 keep 条参与总结但暂缓归档 → 攒 threshold 条、融这 threshold 条
+//     (内容全部进入上层)，只归档最早的 threshold-keep 条；最新 keep 条标记 fusedKeep 继续
+//     显示/注入，但不再参与后续融合，下一轮融合成功后统一归档。两种模式都不会重复融合。
+function keepLatestPlan(threshold, keep) {
+    const k = Math.max(0, keep) || 0;
+    return config.keepLatestInclusive === true
+        ? { trigger: threshold, take: threshold, keepActive: k }
+        : { trigger: threshold + k, take: threshold, keepActive: 0 };
+}
+
+// Sync the 外加/包含 toggle button's state, icon and label from config.
+function renderKeepLatestToggle() {
+    const on = config.keepLatestInclusive === true;
+    $('#wizard-keep-latest-inclusive').attr('data-active', on ? 'true' : 'false');
+    $('#wizard-keep-latest-inclusive-icon').attr('class', on ? 'fa-solid fa-layer-group' : 'fa-solid fa-plus');
+    $('#wizard-keep-latest-inclusive-label').text(on ? '包含：攒 5 融 5，最新 2 延后归档' : '外加：攒 5+2=7 融最早 5');
 }
 
 // Run AT MOST ONE auto-fusion this reply, in priority order 史记 → 周记 → 日记.
@@ -7300,30 +7512,35 @@ function activeSummaryIndices(arr) {
 async function runCascadeFusionOnce() {
     const r2w = parseInt(config.RECAP_TO_WEEKLY) || 10;
     const w2h = parseInt(config.WEEKLY_TO_HISTORICAL) || 5;
+    // "始终保留最新X条"缓冲：最近的 keep 条日记/周记始终留在原层不被融合，防止刚融合完
+    // 近期细节骤减("记忆突然变弱")。keep=0 时行为与之前完全一致。
+    // trigger=触发门槛条数, take=本次融合取用的最早条数（两种语义见 keepLatestPlan）。
+    const recapPlan = keepLatestPlan(r2w, parseInt(config.recapKeepLatest) || 0);
+    const weeklyPlan = keepLatestPlan(w2h, parseInt(config.weeklyKeepLatest) || 0);
 
-    // Active (non-archived) item indices, oldest-first.
-    const activeIdx = activeSummaryIndices;
+    // 可融条目（未归档且未被 fusedKeep 标记），oldest-first.
+    const fusableIdx = fusableSummaryIndices;
 
-    // 1) 史记: when active 周记 >= w2h, merge earliest w2h 周记 -> 1 史记.
+    // 1) 史记: when fusable 周记 >= trigger, merge earliest `take` 周记 -> 1 史记.
     // Gated by autoHistorical — if 史记 auto-fuse is off, threshold can still
     // be crossed but cascade waits for manual fusion.
-    const weeklyActive = activeIdx(summaries.weeklySummaries);
-    if (config.autoHistorical !== false && weeklyActive.length >= w2h) {
-        const pick = weeklyActive.slice(0, w2h);
-        const ok = await fuseSummaries('weekly', 'historical', pick);
-        if (ok) { writeLog(`Cascade: merged ${w2h} 周记 -> 1 史记.`); return; }
-    } else if (config.autoHistorical === false && weeklyActive.length >= w2h) {
-        writeLog(`Cascade skipped: 史记 auto-fuse disabled (${weeklyActive.length} 周记 ready but waiting for manual fusion).`);
+    const weeklyFusable = fusableIdx(summaries.weeklySummaries);
+    if (config.autoHistorical !== false && weeklyFusable.length >= weeklyPlan.trigger) {
+        const pick = weeklyFusable.slice(0, weeklyPlan.take);
+        const ok = await fuseSummaries('weekly', 'historical', pick, weeklyPlan.keepActive);
+        if (ok) { writeLog(`Cascade: merged ${weeklyPlan.take} 周记 -> 1 史记 (${weeklyPlan.keepActive} newest 周记 kept visible, not re-fused).`); return; }
+    } else if (config.autoHistorical === false && weeklyFusable.length >= weeklyPlan.trigger) {
+        writeLog(`Cascade skipped: 史记 auto-fuse disabled (${weeklyFusable.length} 周记 ready but waiting for manual fusion).`);
     }
 
-    // 2) 周记: when active 日记 >= r2w, merge earliest r2w 日记 -> 1 周记.
-    const recapActive = activeIdx(summaries.recaps);
-    if (config.autoWeekly !== false && recapActive.length >= r2w) {
-        const pick = recapActive.slice(0, r2w);
-        const ok = await fuseSummaries('recap', 'weekly', pick);
-        if (ok) { writeLog(`Cascade: merged ${r2w} 日记 -> 1 周记.`); return; }
-    } else if (config.autoWeekly === false && recapActive.length >= r2w) {
-        writeLog(`Cascade skipped: 周记 auto-fuse disabled (${recapActive.length} 日记 ready but waiting for manual fusion).`);
+    // 2) 周记: when fusable 日记 >= trigger, merge earliest `take` 日记 -> 1 周记.
+    const recapFusable = fusableIdx(summaries.recaps);
+    if (config.autoWeekly !== false && recapFusable.length >= recapPlan.trigger) {
+        const pick = recapFusable.slice(0, recapPlan.take);
+        const ok = await fuseSummaries('recap', 'weekly', pick, recapPlan.keepActive);
+        if (ok) { writeLog(`Cascade: merged ${recapPlan.take} 日记 -> 1 周记 (${recapPlan.keepActive} newest 日记 kept visible, not re-fused).`); return; }
+    } else if (config.autoWeekly === false && recapFusable.length >= recapPlan.trigger) {
+        writeLog(`Cascade skipped: 周记 auto-fuse disabled (${recapFusable.length} 日记 ready but waiting for manual fusion).`);
     }
     // 3) 日记 itself is produced by the recap step above; nothing lower to fuse.
 }
@@ -7353,7 +7570,9 @@ async function runManualLayerFusion(type) {
 
         if (type === 'weekly') {
             const threshold = parseInt(config.RECAP_TO_WEEKLY) || 10;
-            const active = activeSummaryIndices(summaries.recaps);
+            // 用可融池而非全部未归档：跳过「延后归档」的 fusedKeep 条目，它们的内容已在周记里，
+            // 再融一次会让周记之间出现重复内容。
+            const active = fusableSummaryIndices(summaries.recaps);
             if (!active.length) {
                 toastr.warning('周记进度条为空：没有可融合的日记。');
                 return false;
@@ -7368,7 +7587,8 @@ async function runManualLayerFusion(type) {
 
         if (type === 'historical') {
             const threshold = parseInt(config.WEEKLY_TO_HISTORICAL) || 5;
-            const active = activeSummaryIndices(summaries.weeklySummaries);
+            // 同上：跳过「延后归档」的 fusedKeep 周记，避免史记之间重复内容。
+            const active = fusableSummaryIndices(summaries.weeklySummaries);
             if (!active.length) {
                 toastr.warning('史记进度条为空：没有可融合的周记。');
                 return false;
@@ -7390,7 +7610,10 @@ async function runManualLayerFusion(type) {
     }
 }
 
-async function fuseSummaries(fromType, toType, indices) {
+// keepActive: 融合后不归档的「最新 N 条源」数量（「始终保留最新X条」的包含模式）。
+// 这些源的内容已经进入上层记录，但它们继续以本层身份存在，防止刚融合完近期细节骤减。
+// 0 = 全部归档（默认，与改动前一致）。
+async function fuseSummaries(fromType, toType, indices, keepActive = 0) {
     const fromArr = getSummaryArray(fromType);
     if (!fromArr) return false;
     const toArr = getSummaryArray(toType);
@@ -7520,7 +7743,16 @@ ${returnShape}`;
             ...(coveredFloors ? { coveredFloors } : {}),
         });
         // Archive the sources (keep on disk, greyed, restorable).
-        indices.forEach(i => sumSetArchived(fromArr, i, true));
+        // 先收掉上一轮「包含模式」留下的 fusedKeep 条目：它们的内容早已进入上层，只是多留了
+        // 一轮供近期参照，现在新一轮融合已产出，可以归档了。
+        for (let i = 0; i < fromArr.length; i++) {
+            if (sumIsFusedKeep(fromArr[i]) && !indices.includes(i)) sumSetArchived(fromArr, i, true);
+        }
+        // 本批：最早的 take-keepActive 条直接归档，最新 keepActive 条标记 fusedKeep 留在本层。
+        // 它们已被算进上层记录，所以下轮不会再参与融合 —— 上层不会出现重复内容。
+        const cut = keepActive > 0 ? Math.max(0, sorted.length - keepActive) : sorted.length;
+        sorted.slice(0, cut).forEach(i => sumSetArchived(fromArr, i, true));
+        sorted.slice(cut).forEach(i => sumSetFusedKeep(fromArr, i, true));
         return true;
     } catch (e) {
         writeLog(`${toName} merge failed: ${e.message}`, 'ERROR');
@@ -8237,15 +8469,24 @@ function msgModel(msg) {
 function highlightKeyword(text, kw) {
     const safe = escapeHtml(text);
     if (!kw) return { html: safe, hits: 0 };
-    // Escape the keyword for both HTML (so it lines up with `safe`) and regex meta.
-    const safeKw = escapeHtml(kw).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // Whitespace-separated terms are AND-matched; highlight every matched term.
+    const terms = String(kw).trim().split(/\s+/).filter(Boolean)
+        .map(term => escapeHtml(term).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    if (!terms.length) return { html: safe, hits: 0 };
     let hits = 0;
-    const html = safe.replace(new RegExp(safeKw, 'gi'), (m) => {
+    const html = safe.replace(new RegExp(terms.join('|'), 'gi'), (m) => {
         hits++;
         const cls = hits === 1 ? 'wizard-kw-hit' : '';
         return `<mark class="${cls}" style="background:#f97316; color:#1a1a1a; border-radius:2px; padding:0 1px;">${m}</mark>`;
     });
     return { html, hits };
+}
+
+// Space-separated keywords are an AND query: every term must occur in this one floor.
+function keywordMatches(text, keyword) {
+    const haystack = String(text || '').toLowerCase();
+    return String(keyword || '').trim().split(/\s+/).filter(Boolean)
+        .every(term => haystack.includes(term.toLowerCase()));
 }
 
 // Does a regex tag's optional role/position window apply to this floor?
@@ -8422,10 +8663,10 @@ function messagePassesFilters(msg, floor, coverageMap) {
     // any active keyword (tag or live box) must still be present in its full body.
     if (passthroughSide) {
         const liveKwPT = (config.sandboxKeyword || '').trim();
-        const body = msgBody(msg).toLowerCase();
-        if (liveKwPT && !body.includes(liveKwPT.toLowerCase())) return false;
+        const body = msgBody(msg);
+        if (liveKwPT && !keywordMatches(body, liveKwPT)) return false;
         for (const f of sandboxFilters) {
-            if (f.type === 'keyword' && f.value && !body.includes(f.value.toLowerCase())) return false;
+            if (f.type === 'keyword' && f.value && !keywordMatches(body, f.value)) return false;
         }
         return true;
     }
@@ -8434,14 +8675,14 @@ function messagePassesFilters(msg, floor, coverageMap) {
     // Live keyword (typed in the keyword box, applies without a tag). It is treated
     // as right-most, so every regex tag narrows its search scope (left = stronger).
     const liveKw = (config.sandboxKeyword || '').trim();
-    if (liveKw && !keywordScopeText(msg, -1, floor).toLowerCase().includes(liveKw.toLowerCase())) return false;
+    if (liveKw && !keywordMatches(keywordScopeText(msg, -1, floor), liveKw)) return false;
     for (let fi = 0; fi < sandboxFilters.length; fi++) {
         const f = sandboxFilters[fi];
         if (f.type === 'keyword' && f.value) {
             // ctrl+F style: case-insensitive substring search, but ONLY within the
             // text left by regex tags positioned to this keyword's LEFT (higher
             // weight). With no regex to its left, it searches the full body.
-            if (!keywordScopeText(msg, fi, floor).toLowerCase().includes(f.value.toLowerCase())) return false;
+            if (!keywordMatches(keywordScopeText(msg, fi, floor), f.value)) return false;
         } else if (f.type === 'regex' && f.value) {
             // A KEEP regex tag also acts as a filter (AND): the message must contain a
             // match for EVERY active keep tag. Multiple regex tags are allowed.
@@ -8743,7 +8984,7 @@ function renderSandboxChat() {
                 : { html: escapeHtml(shownText) };
             // When the keyword is highlighted in this box, mark the box with an orange
             // left bar; otherwise keep the green/grey regex-match indicator.
-            const kwInBox = activeKw && shownText.toLowerCase().includes(activeKw.toLowerCase());
+            const kwInBox = activeKw && keywordMatches(shownText, activeKw);
             const barColor = kwInBox ? '#f97316' : (matched ? '#34d399' : 'rgba(255,255,255,0.15)');
             // Label: keep-only → 匹配 / 无匹配；remove-only → 处理后 / 无匹配（未改动）；mixed → 处理后.
             let label;
@@ -9460,6 +9701,10 @@ function registerNodeFormListeners() {
         saveConfig(true);
         syncFakeChatRegex(); // 立即同步 ST 全局 regex 脚本（开 → 检查/创建并启用；关 → disabled）。
     });
+    $(document).off('change', '#wizard-fake-chat-history-summaries').on('change', '#wizard-fake-chat-history-summaries', function () {
+        config.fakeChatHistoryIncludeSummaries = $(this).prop('checked');
+        saveConfig(true);
+    });
 
     $(document).off('input change', '#wizard-anthropic-cache-control-json').on('input change', '#wizard-anthropic-cache-control-json', function () {
         config.anthropicCacheControlJson = $(this).val() || defaultAnthropicCacheControlJson();
@@ -10126,7 +10371,10 @@ function registerNodeFormListeners() {
             populateSandboxRecordNames($('#wizard-sandbox-record-type').val() || 'historical');
         }
     }
-    $(document).off('change', '#wizard-sandbox-match-mode').on('change', '#wizard-sandbox-match-mode', syncSandboxModeInputs);
+    $(document).off('change', '#wizard-sandbox-match-mode').on('change', '#wizard-sandbox-match-mode', function () {
+        syncSandboxModeInputs();
+        saveConfig(true);
+    });
     // Allow external callers (tab switch) to refresh the tag chips + mode inputs.
     // When the panel opens we also AUTO-APPLY the saved active match template so its
     // saved filter rules (sandboxFilters/regex/keyword) are actually in effect — not
@@ -12371,6 +12619,1088 @@ function registerNodeFormListeners() {
 
     // ─── End AI Shrink ───────────────────────────────────────────────────────
 
+    // ══════════════════════════════════════════════════════════════════════
+    // REGION: 世界书面板（World Book）— 读取/编辑酒馆世界书，AI 单条/多条修改
+    // ══════════════════════════════════════════════════════════════════════
+    // SillyTavern World Info API（全部经 context，不新增后端路由）：
+    //   loadWorldInfo(name) → { entries: { [uid]: WIEntry } }
+    //   saveWorldInfo(name, data, immediately=false)
+    //   getWorldInfoNames() → string[]
+    //   updateWorldInfoList() → 刷新名称列表
+    //   openWorldInfoEditor(name) / showWorldEditor / reloadWorldInfoEditor
+    //   eventTypes.WORLDINFO_UPDATED → 保存后触发，用于失效缓存
+    // 角色卡绑定世界书：context.characters[context.characterId]?.data?.extensions?.world
+    // 群聊无单角色绑定 → 退化为手动选择。
+    // （内置默认 Prompt、WB_OP_FIELDS、状态变量均已上移到顶层作用域，紧邻 loadConfig 之前，
+    //  以便 loadConfig/saveConfig 与本区域的嵌套函数都能访问。）
+
+    function wbCtx() {
+        return window.SillyTavern?.getContext?.() || null;
+    }
+
+    // 当前楼层号（0-indexed 最新楼）。优先 live chat，退回 sandboxChatContext。
+    function getCurrentFloorNumber() {
+        const ctx = wbCtx();
+        const live = Array.isArray(ctx?.chat) ? ctx.chat.length - 1 : -1;
+        if (live >= 0) return live;
+        return Array.isArray(sandboxChatContext) ? sandboxChatContext.length - 1 : -1;
+    }
+
+    // 角色卡绑定的世界书名；群聊/无绑定返回 null。
+    function detectCharLinkedWorld() {
+        const ctx = wbCtx();
+        if (!ctx) return null;
+        if (ctx.groupId) return null; // 群聊无单一绑定
+        const chars = ctx.characters;
+        const chid = ctx.characterId;
+        if (Array.isArray(chars) && chid !== undefined && chid_valid(chid, chars)) {
+            const w = chars[chid]?.data?.extensions?.world;
+            return (typeof w === 'string' && w.trim()) ? w.trim() : null;
+        }
+        return null;
+    }
+
+    // 读取世界书（带简单内存缓存，WORLDINFO_UPDATED 会失效）。
+    async function loadWbData(name) {
+        if (!name) return null;
+        if (wbCache && wbCache.name === name && wbCache.data) return wbCache.data;
+        const ctx = wbCtx();
+        if (!ctx?.loadWorldInfo) return null;
+        try {
+            const data = await ctx.loadWorldInfo(name);
+            if (data) {
+                wbCache = { name, data, ts: Date.now() };
+                return data;
+            }
+        } catch (e) {
+            writeLog(`WB loadWorldInfo("${name}") failed: ${e.message}`, 'ERROR');
+            toastr.error(`读取世界书失败: ${e.message}`);
+        }
+        return null;
+    }
+
+    // 保存世界书（immediately=true 立即落盘）。保存前若 WI 编辑被禁用会等待。
+    async function saveWbData(name, data) {
+        const ctx = wbCtx();
+        if (!ctx?.saveWorldInfo) { toastr.error('当前 SillyTavern 不支持 saveWorldInfo。'); return false; }
+        try {
+            if (typeof ctx.waitDuringWIDisabled === 'function') await ctx.waitDuringWIDisabled();
+            await ctx.saveWorldInfo(name, data, true);
+            // 保存后失效缓存（WORLDINFO_UPDATED 也会触发，这里双保险）。
+            if (wbCache && wbCache.name === name) wbCache = null;
+            return true;
+        } catch (e) {
+            writeLog(`WB saveWorldInfo("${name}") failed: ${e.message}`, 'ERROR');
+            toastr.error(`保存世界书失败: ${e.message}`);
+            return false;
+        }
+    }
+
+    function nextWbUid(data) {
+        const entries = data?.entries || {};
+        let max = -1;
+        for (const k of Object.keys(entries)) {
+            const u = Number(entries[k]?.uid);
+            if (!isNaN(u) && u > max) max = u;
+        }
+        return max + 1;
+    }
+
+    function wbEntryArr(data) {
+        const entries = data?.entries || {};
+        return Object.entries(entries).map(([k, e]) => ({ key: k, entry: e })).filter(x => x.entry && typeof x.entry === 'object');
+    }
+
+    function serializeEntryForAi(entry, mode) {
+        const uid = entry.uid;
+        const comment = entry.comment || '(无标题)';
+        if (mode === 'titles') return `[#${uid}] ${comment}`;
+        const keys = Array.isArray(entry.key) ? entry.key.join(', ') : (entry.key || '');
+        const sec = Array.isArray(entry.keysecondary) && entry.keysecondary.length ? ` / ${entry.keysecondary.join(', ')}` : '';
+        const content = entry.content || '';
+        return `[#${uid}] ${comment}\nkeys: [${keys}${sec}]\ncontent:\n${content}`;
+    }
+
+    function serializeWorldBookForAi(data, mode) {
+        return wbEntryArr(data).map(({ entry }) => serializeEntryForAi(entry, mode)).join('\n\n');
+    }
+
+    // 楼层范围正文：格式同 fusion `#floor [name]: body`，用 live chat，不带筛选。
+    function getWbFloorRangeText(start, end) {
+        const ctx = wbCtx();
+        const chat = Array.isArray(ctx?.chat) ? ctx.chat : (Array.isArray(sandboxChatContext) ? sandboxChatContext : []);
+        if (!chat.length) return '';
+        const lo = (start === '' || start === null || isNaN(parseInt(start))) ? 0 : Math.max(0, parseInt(start));
+        const hi = (end === '' || end === null || isNaN(parseInt(end))) ? chat.length - 1 : Math.min(chat.length - 1, parseInt(end));
+        if (lo > hi) return '';
+        const lines = [];
+        for (let f = lo; f <= hi; f++) {
+            const m = chat[f];
+            if (!m) continue;
+            lines.push(`#${f} [${msgName(m)}]: ${msgBody(m)}`);
+        }
+        return lines.join('\n');
+    }
+
+    // ── 渲染 ──
+    async function renderWbBookSelector() {
+        const ctx = wbCtx();
+        const $sel = $('#wizard-wb-select');
+        $sel.empty().append('<option value="">-- 请选择世界书 --</option>');
+        let names = [];
+        try {
+            if (ctx?.getWorldInfoNames) names = ctx.getWorldInfoNames() || [];
+        } catch (e) { writeLog(`WB getWorldInfoNames failed: ${e.message}`, 'ERROR'); }
+        names.forEach(n => $sel.append($('<option></option>').val(n).text(n)));
+
+        // 跟随角色卡：自动选择绑定书。
+        const follow = $('#wizard-wb-follow-char').prop('checked');
+        const linked = detectCharLinkedWorld();
+        const hint = $('#wizard-wb-auto-hint');
+        if (linked) {
+            hint.text(`角色卡绑定: ${linked}`).css('color', '#34d399');
+            if (follow && names.includes(linked)) {
+                wbSelectedBook = linked;
+            }
+        } else {
+            hint.text(ctx?.groupId ? '群聊：需手动选择' : '当前角色未绑定世界书').css('color', '#6b7280');
+        }
+        $sel.val(wbSelectedBook || "");
+    }
+
+    function renderWbEntryList(data) {
+        const $list = $('#wizard-wb-entry-list');
+        $list.empty();
+        if (!data) { $list.html('<span class="wizard-wb-empty">未读取世界书</span>'); requestAnimationFrame(recheckWbOverflow); return; }
+        const arr = wbEntryArr(data);
+        if (!arr.length) { $list.html('<span class="wizard-wb-empty">世界书为空</span>'); $('#wizard-wb-entry-count').text(''); requestAnimationFrame(recheckWbOverflow); return; }
+        $('#wizard-wb-entry-count').text(`共 ${arr.length} 条`);
+        arr.forEach(({ entry }) => {
+            const uid = entry.uid;
+            const sel = (uid === wbSelectedUid) ? ' wizard-wb-selected' : '';
+            const off = entry.disable ? ' wizard-wb-disabled' : '';
+            const checked = wbMultiSelectedUids.has(uid) ? 'checked' : '';
+            const title = entry.comment || '(无标题)';
+            const keys = Array.isArray(entry.key) ? entry.key.join(', ') : (entry.key || '');
+            const badges = [];
+            if (entry.constant) badges.push('<span class="wizard-wb-badge wizard-wb-badge-const">常驻</span>');
+            if (entry.disable) badges.push('<span class="wizard-wb-badge wizard-wb-badge-off">禁用</span>');
+            const row = $(
+                `<div class="wizard-wb-entry-row${sel}${off}" data-uid="${uid}">
+                    <input type="checkbox" class="wizard-wb-entry-checkbox" data-uid="${uid}" ${checked} style="margin-top:3px;">
+                    <div class="wizard-wb-entry-main">
+                        <div class="wizard-wb-entry-title">${escapeHtml(title)}</div>
+                        ${keys ? `<div class="wizard-wb-entry-keys">keys: ${escapeHtml(keys)}</div>` : ''}
+                        <div class="wizard-wb-entry-badges">${badges.join('')}</div>
+                    </div>
+                </div>`
+            );
+            $list.append(row);
+        });
+        updateWbMultiCount();
+        requestAnimationFrame(recheckWbOverflow);
+    }
+
+    function updateWbMultiCount() {
+        const total = wbEntryArr(wbCache?.data).length;
+        const n = wbMultiSelectedUids.size;
+        $('#wizard-wb-entry-count').text(total ? `共 ${total} 条${n ? ' · 已选 ' + n : ''}` : '');
+    }
+
+    function setWbSingleTarget(entry) {
+        if (!entry) {
+            wbSelectedUid = null;
+            $('#wizard-wb-single-target').text('未选择条目（点击上方列表条目）');
+            return;
+        }
+        wbSelectedUid = entry.uid;
+        $('#wizard-wb-single-target').html(`目标: <b>#${entry.uid} ${escapeHtml(entry.comment || '(无标题)')}</b>`);
+    }
+
+    function recheckWbOverflow() {
+        const panel = document.getElementById('wizard-wb-panel');
+        if (!panel || $('#wizard-wb-panel').css('display') === 'none') return;
+        panel.classList.toggle('wizard-wb-overflowing', panel.scrollHeight > panel.clientHeight + 1);
+    }
+
+    function startWbOverflowObserver() {
+        const panel = document.getElementById('wizard-wb-panel');
+        if (!panel) return;
+        stopWbOverflowObserver();
+        requestAnimationFrame(recheckWbOverflow);
+        if (typeof ResizeObserver === 'function') {
+            wbOverflowObserver = new ResizeObserver(() => recheckWbOverflow());
+            wbOverflowObserver.observe(panel);
+        }
+        window.addEventListener('resize', recheckWbOverflow);
+    }
+
+    function stopWbOverflowObserver() {
+        if (wbOverflowObserver) {
+            wbOverflowObserver.disconnect();
+            wbOverflowObserver = null;
+        }
+        window.removeEventListener('resize', recheckWbOverflow);
+        const panel = document.getElementById('wizard-wb-panel');
+        if (panel) panel.classList.remove('wizard-wb-overflowing');
+    }
+
+    // ── 宏展开 ──
+    function expandWbMacros(template, ctxObj) {
+        let out = template || '';
+        const replace = (name, val) => {
+            const re = new RegExp(`\\{\\{\\s*${name}\\s*\\}\\}`, 'gi');
+            if (re.test(out)) out = out.replace(re, val == null ? '' : val);
+        };
+        if (ctxObj.entry) {
+            replace('entry_title', ctxObj.entry.comment || '');
+            replace('entry_content', ctxObj.entry.content || '');
+            const k = Array.isArray(ctxObj.entry.key) ? ctxObj.entry.key.join(', ') : (ctxObj.entry.key || '');
+            replace('entry_keys', k);
+            replace('entry_uid', ctxObj.entry.uid);
+        }
+        if (ctxObj.entriesFull !== undefined) replace('entries_full', ctxObj.entriesFull);
+        if (ctxObj.entriesTitles !== undefined) replace('entries_titles', ctxObj.entriesTitles);
+        if (ctxObj.wbFull !== undefined) replace('world_book_full', ctxObj.wbFull);
+        if (ctxObj.wbTitles !== undefined) replace('world_book_titles', ctxObj.wbTitles);
+        if (ctxObj.memoryTree !== undefined) replace('memory_tree', ctxObj.memoryTree);
+        if (ctxObj.floors !== undefined) replace('floors', ctxObj.floors);
+        return out;
+    }
+
+    // ── Token 统计（快估 + ST 真实分词器，带 seq 防过期）──
+    // _wbTokenSeq 已上移到顶层作用域。
+    async function refineWbTokens(payloadText, $el, fastTokens) {
+        const ctx = wbCtx();
+        const seq = ++_wbTokenSeq;
+        try {
+            if (ctx?.getTokenCountAsync) {
+                const exact = await ctx.getTokenCountAsync(payloadText);
+                if (seq === _wbTokenSeq) {
+                    $el.text(`约 ${fastTokens.toLocaleString()} / 精确 ${exact.toLocaleString()} tokens`);
+                }
+            }
+        } catch (_) { /* 保留快估值 */ }
+    }
+
+    function buildWbSinglePayload() {
+        const data = wbCache?.data;
+        const entry = (data && wbSelectedUid != null) ? (data.entries[String(wbSelectedUid)] || data.entries[wbSelectedUid]) : null;
+        if (!entry) return null;
+        const mode = wbLastSingleMode || 'reduce';
+        const tmpl = $('#wizard-wb-single-prompt').val() || config[`wbPrompt${mode.charAt(0).toUpperCase() + mode.slice(1)}`] || '';
+        const def = mode === 'reduce' ? DEFAULT_WB_PROMPT_REDUCE : mode === 'complete' ? DEFAULT_WB_PROMPT_COMPLETE : DEFAULT_WB_PROMPT_REWRITE;
+        const template = tmpl || def;
+        const treeText = serializeTreeForAi(memoryTree, 0);
+        const floors = getWbFloorRangeText($('#wizard-wb-single-floor-start').val(), $('#wizard-wb-single-floor-end').val());
+        const expanded = expandWbMacros(template, { entry, memoryTree: treeText, floors });
+        // 未放置 entry_content/floors/memory_tree 的内容自动追加。
+        const hasEntry = /\{\{\s*entry_content\s*\}\}/i.test(template);
+        const hasFloors = /\{\{\s*floors\s*\}\}/i.test(template);
+        const hasTree = /\{\{\s*memory_tree\s*\}\}/i.test(template);
+        let user = expanded;
+        if (!hasEntry) user += `\n\n[条目正文]\n${entry.content || ''}`;
+        if (floors && !hasFloors) user += `\n\n[楼层范围]\n${floors}`;
+        if (treeText && !hasTree) user += `\n\n[记忆树]\n${treeText}`;
+        return { systemPrompt: WB_SINGLE_SYSTEM_PROMPT, userContent: user, entry };
+    }
+
+    function buildWbMultiPayload() {
+        const data = wbCache?.data;
+        if (!data) return null;
+        const arr = wbEntryArr(data);
+        const selected = arr.filter(({ entry }) => wbMultiSelectedUids.has(entry.uid)).map(x => x.entry);
+        if (!selected.length) return null;
+        const entriesFull = selected.map(e => serializeEntryForAi(e, 'full')).join('\n\n');
+        const entriesTitles = selected.map(e => serializeEntryForAi(e, 'titles')).join('\n');
+        const wbFull = arr.map(({ entry }) => serializeEntryForAi(entry, 'full')).join('\n\n');
+        const wbTitles = arr.map(({ entry }) => serializeEntryForAi(entry, 'titles')).join('\n');
+        const treeText = serializeTreeForAi(memoryTree, 0);
+        const floors = getWbFloorRangeText($('#wizard-wb-multi-floor-start').val(), $('#wizard-wb-multi-floor-end').val());
+        const template = $('#wizard-wb-multi-prompt').val() || config.wbPromptMulti || DEFAULT_WB_PROMPT_MULTI;
+        const expanded = expandWbMacros(template, { entriesFull, entriesTitles, wbFull, wbTitles, memoryTree: treeText, floors });
+        const hasFull = /\{\{\s*(world_book_full|entries_full)\s*\}\}/i.test(template);
+        const hasFloors = /\{\{\s*floors\s*\}\}/i.test(template);
+        const hasTree = /\{\{\s*memory_tree\s*\}\}/i.test(template);
+        let user = expanded;
+        if (!hasFull) user += `\n\n[当前世界书（含正文）]\n${wbFull}`;
+        if (floors && !hasFloors) user += `\n\n[楼层范围]\n${floors}`;
+        if (treeText && !hasTree) user += `\n\n[记忆树]\n${treeText}`;
+        return { systemPrompt: WB_MULTI_SYSTEM_PROMPT, userContent: user, selected };
+    }
+
+    function updateWbSingleTokenStats() {
+        const $el = $('#wizard-wb-single-token-count');
+        const p = buildWbSinglePayload();
+        if (!p) { $el.text(''); return; }
+        const full = `${p.systemPrompt}\n${p.userContent}`;
+        const fast = estimateTokens(full);
+        $el.text(`约 ${fast.toLocaleString()} tokens`);
+        refineWbTokens(full, $el, fast);
+    }
+
+    function updateWbMultiTokenStats() {
+        const $el = $('#wizard-wb-multi-token-count');
+        const p = buildWbMultiPayload();
+        if (!p) { $el.text(''); return; }
+        const full = `${p.systemPrompt}\n${p.userContent}`;
+        const fast = estimateTokens(full);
+        $el.text(`约 ${fast.toLocaleString()} tokens`);
+        refineWbTokens(full, $el, fast);
+    }
+
+    // ── 操作归一化 / 校验 / 应用 ──
+    function normalizeWbOp(raw) {
+        if (!raw || typeof raw !== 'object') return null;
+        const op = (raw.op || raw.action || '').toString().toLowerCase();
+        if (!['update', 'add', 'delete', 'merge'].includes(op)) return null;
+        const o = { op };
+        if (op === 'update') {
+            o.uid = raw.uid != null ? Number(raw.uid) : null;
+            o.fields = {};
+            if (raw.fields && typeof raw.fields === 'object') {
+                for (const k of WB_OP_FIELDS) if (k in raw.fields) o.fields[k] = raw.fields[k];
+            } else {
+                for (const k of WB_OP_FIELDS) if (k in raw) o.fields[k] = raw[k];
+            }
+            if (o.uid == null || !Object.keys(o.fields).length) return null;
+        } else if (op === 'add') {
+            o.fields = {};
+            const src = (raw.fields && typeof raw.fields === 'object') ? raw.fields : raw;
+            for (const k of WB_OP_FIELDS) if (k in src) o.fields[k] = src[k];
+            if (o.fields.comment === undefined || o.fields.content === undefined) return null;
+        } else if (op === 'delete') {
+            o.uid = raw.uid != null ? Number(raw.uid) : (raw.sourceUid != null ? Number(raw.sourceUid) : null);
+            if (o.uid == null) return null;
+        } else if (op === 'merge') {
+            o.sourceUid = raw.sourceUid != null ? Number(raw.sourceUid) : null;
+            o.targetUid = raw.targetUid != null ? Number(raw.targetUid) : null;
+            o.mode = raw.mode || 'both';
+            if (o.sourceUid == null || o.targetUid == null || o.sourceUid === o.targetUid) return null;
+        }
+        return o;
+    }
+
+    function validateWbOp(op, data, toggles) {
+        const entries = data.entries || {};
+        const hasUid = u => entries[String(u)] != null || entries[u] != null;
+        if (op.op === 'update') {
+            if (!toggles.allowChange) return { ok: false, reason: '未开启「允许修改已有条目」' };
+            if (!hasUid(op.uid)) return { ok: false, reason: `update: uid ${op.uid} 不存在` };
+        } else if (op.op === 'add') {
+            if (!toggles.allowAdd) return { ok: false, reason: '未开启「允许新增条目」' };
+        } else if (op.op === 'delete') {
+            if (!toggles.allowDeleteMerge) return { ok: false, reason: '未开启「允许删除/合并」' };
+            if (!hasUid(op.uid)) return { ok: false, reason: `delete: uid ${op.uid} 不存在` };
+        } else if (op.op === 'merge') {
+            if (!toggles.allowDeleteMerge) return { ok: false, reason: '未开启「允许删除/合并」' };
+            if (!hasUid(op.sourceUid) || !hasUid(op.targetUid)) return { ok: false, reason: 'merge: uid 不存在' };
+        }
+        return { ok: true };
+    }
+
+    function findEntry(data, uid) {
+        const e = data.entries;
+        return e[String(uid)] != null ? e[String(uid)] : e[uid];
+    }
+
+    // 应用前快照（一键撤回）。
+    function snapshotWb(name, data) {
+        try { wbLastSnapshot = { name, data: JSON.parse(JSON.stringify(data)) }; } catch (_) { wbLastSnapshot = null; }
+        $('#wizard-wb-undo-btn').css('display', wbLastSnapshot ? '' : 'none');
+    }
+
+    async function applyWbOps(ops) {
+        const name = wbSelectedBook;
+        if (!name) return 0;
+        const data = await loadWbData(name);
+        if (!data) return 0;
+        snapshotWb(name, data);
+        const entries = data.entries || (data.entries = {});
+        let applied = 0;
+        for (const op of ops) {
+            if (op.op === 'update') {
+                const e = findEntry(data, op.uid);
+                if (!e) continue;
+                for (const k of Object.keys(op.fields)) e[k] = op.fields[k];
+                applied++;
+            } else if (op.op === 'add') {
+                const uid = nextWbUid(data);
+                const base = { uid, key: [], keysecondary: [], comment: '', content: '', constant: false, vectorized: false, selective: true, selectiveLogic: 0, addMemo: false, order: 100, position: 0, disable: false, ignoreBudget: false, excludeRecursion: false, preventRecursion: false, delayUntilRecursion: 0, probability: 100, useProbability: true, depth: 4, group: '', groupOverride: false, groupWeight: 100, role: 0 };
+                entries[String(uid)] = { ...base, ...op.fields, uid };
+                applied++;
+            } else if (op.op === 'delete') {
+                if (findEntry(data, op.uid)) { delete entries[String(op.uid)]; delete entries[op.uid]; applied++; }
+            } else if (op.op === 'merge') {
+                const s = findEntry(data, op.sourceUid);
+                const t = findEntry(data, op.targetUid);
+                if (!s || !t) continue;
+                if (op.mode !== 'keys') {
+                    t.content = (t.content || '') + (s.content ? `\n\n${s.content}` : '');
+                }
+                if (op.mode !== 'content') {
+                    t.key = Array.from(new Set([...(t.key || []), ...(s.key || [])]));
+                    t.keysecondary = Array.from(new Set([...(t.keysecondary || []), ...(s.keysecondary || [])]));
+                }
+                delete entries[String(op.sourceUid)]; delete entries[op.sourceUid];
+                applied++;
+            }
+        }
+        if (applied > 0) {
+            const ok = await saveWbData(name, data);
+            if (!ok) return 0;
+            await refreshWbEntryList();
+        }
+        return applied;
+    }
+
+    async function applyWbSingle(entry, newFields) {
+        const name = wbSelectedBook;
+        if (!name) return false;
+        const data = await loadWbData(name);
+        if (!data) return false;
+        const e = findEntry(data, entry.uid);
+        if (!e) { toastr.error('条目已不存在（可能被外部改动）。'); return false; }
+        snapshotWb(name, data);
+        for (const k of Object.keys(newFields)) {
+            if (WB_OP_FIELDS.includes(k)) e[k] = newFields[k];
+        }
+        const ok = await saveWbData(name, data);
+        if (!ok) return false;
+        await refreshWbEntryList();
+        return true;
+    }
+
+    async function undoWb() {
+        if (!wbLastSnapshot) return;
+        const ok = await saveWbData(wbLastSnapshot.name, wbLastSnapshot.data);
+        if (ok) {
+            toastr.success('已撤回上一次世界书应用。');
+            wbLastSnapshot = null;
+            $('#wizard-wb-undo-btn').css('display', 'none');
+            await refreshWbEntryList();
+        }
+    }
+
+    // ── 多条待确认操作行 ──
+    function insertWbOpRow(op, idx) {
+        const $list = $('#wizard-wb-entry-list');
+        const key = `op_${idx}_${op.op}_${op.uid != null ? op.uid : (op.sourceUid + '_' + op.targetUid)}`;
+        let desc = '';
+        let oldText = '', newText = '';
+        const data = wbCache?.data;
+        if (op.op === 'update') {
+            const e = findEntry(data || { entries: {} }, op.uid);
+            desc = `修改 #${op.uid} ${e ? (e.comment || '(无标题)') : ''}`;
+            oldText = e ? (e.content || '') : '';
+            newText = op.fields.content != null ? op.fields.content : oldText;
+            if (op.fields.comment && (!e || op.fields.comment !== e.comment)) desc += ` · 改标题为「${op.fields.comment}」`;
+        } else if (op.op === 'add') {
+            desc = `新增条目「${op.fields.comment}」`;
+            newText = op.fields.content || '';
+        } else if (op.op === 'delete') {
+            const e = findEntry(data || { entries: {} }, op.uid);
+            desc = `删除 #${op.uid} ${e ? (e.comment || '') : ''}`;
+            oldText = e ? (e.content || '') : '';
+        } else if (op.op === 'merge') {
+            const s = findEntry(data || { entries: {} }, op.sourceUid);
+            const t = findEntry(data || { entries: {} }, op.targetUid);
+            desc = `合并 #${op.sourceUid} → #${op.targetUid}`;
+            oldText = (s ? s.content || '' : '') + '\n──── 并入 ────\n' + (t ? t.content || '' : '');
+            newText = (t ? t.content || '' : '') + (s && s.content ? `\n\n${s.content}` : '');
+        }
+        const $row = $(
+            `<div class="wizard-wb-op-row" data-key="${escapeHtml(key)}">
+                <div class="wizard-wb-op-head"><i class="fa-solid fa-wand-magic-sparkles"></i> ${escapeHtml(desc)}
+                    <button class="wizard-btn wizard-wb-op-accept" data-key="${escapeHtml(key)}" style="margin-left:auto;padding:2px 8px;font-size:0.72em;background:rgba(52,211,153,0.15);border:1px solid rgba(52,211,153,0.5);color:#34d399;">应用</button>
+                    <button class="wizard-btn wizard-wb-op-reject" data-key="${escapeHtml(key)}" style="padding:2px 8px;font-size:0.72em;background:rgba(248,113,113,0.12);border:1px solid rgba(248,113,113,0.4);color:#f87171;">丢弃</button>
+                </div>
+                <div class="wizard-wb-op-diff">
+                    <div class="wizard-wb-op-col"><b>原</b>\n${escapeHtml(oldText)}</div>
+                    <div class="wizard-wb-op-col"><b>新</b>\n${escapeHtml(newText)}</div>
+                </div>
+            </div>`
+        );
+        $list.append($row);
+        wbPendingOps.set(key, op);
+        updateWbOpsBulkBar();
+    }
+
+    function updateWbOpsBulkBar() {
+        const n = wbPendingOps.size;
+        const $bar = $('#wizard-wb-ops-bulk-bar');
+        if (n > 0) { $bar.css('display', 'inline-flex'); $('#wizard-wb-ops-pending-count').text(`${n} 条建议`); }
+        else { $bar.css('display', 'none'); }
+        requestAnimationFrame(recheckWbOverflow);
+    }
+
+    // ── 解析 AI 输出 ──
+    function processWbSingleOutput(rawText, entry) {
+        let raw = (rawText || '').trim();
+        raw = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+        let newFields = null;
+        // 优先尝试 JSON 对象解析。
+        if (raw.startsWith('{')) {
+            try {
+                const obj = JSON.parse(raw);
+                if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+                    newFields = {};
+                    for (const k of WB_OP_FIELDS) if (k in obj) newFields[k] = obj[k];
+                    if (!Object.keys(newFields).length) newFields = null;
+                }
+            } catch (_) { newFields = null; }
+        }
+        // 退化为纯正文 → content。
+        if (!newFields) newFields = { content: raw };
+        return newFields;
+    }
+
+    function processWbMultiOutput(rawText, data, toggles) {
+        let raw = (rawText || '').trim();
+        raw = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+        let arr;
+        try { arr = JSON.parse(raw); } catch (e) {
+            toastr.error('AI 返回的不是合法 JSON 数组，未应用。');
+            $('#wizard-wb-multi-status').text('解析失败：AI 未返回合法 JSON。');
+            $('#wizard-wb-stream-status').text('格式错误，未应用').css('color', '#ef4444');
+            return [];
+        }
+        if (!Array.isArray(arr)) { toastr.error('AI 返回的不是 JSON 数组。'); return []; }
+        const valid = [];
+        arr.forEach(item => {
+            const op = normalizeWbOp(item);
+            if (!op) { writeLog(`WB op ignored: unparseable: ${JSON.stringify(item).slice(0,120)}`, 'WARNING'); return; }
+            const v = validateWbOp(op, data, toggles);
+            if (!v.ok) { writeLog(`WB op dropped: ${op.op}: ${v.reason}`, 'WARNING'); toastr.warning(`已丢弃一条操作：${v.reason}`); return; }
+            valid.push(op);
+        });
+        return valid;
+    }
+
+    // ── 流式 UI helpers ──
+    function wbStreamResetUI() {
+        $('#wizard-wb-stream-body').val('');
+        $('#wizard-wb-stream-reasoning').val('');
+        $('#wizard-wb-stream-reasoning-wrap').hide().prop('open', false);
+        $('#wizard-wb-stream-stats').text('0 字符 · 0 tokens');
+        $('#wizard-wb-stream-status').text('连接中...').css('color', '#9ca3af');
+        $('#wizard-wb-stream-abort-btn').show().prop('disabled', false);
+    }
+
+    function wbStreamOnChunk(fullText, reasoningText) {
+        const bodyEl = document.getElementById('wizard-wb-stream-body');
+        if (!bodyEl) return;
+        const wasAtBottom = (bodyEl.scrollTop + bodyEl.clientHeight >= bodyEl.scrollHeight - 50);
+        const { body: cleanBody, thinking: inlineThinking } = splitInlineThinking(fullText);
+        bodyEl.value = cleanBody;
+        const thinking = (reasoningText || '').trim() || inlineThinking;
+        if (thinking) {
+            $('#wizard-wb-stream-reasoning').val(thinking);
+            $('#wizard-wb-stream-reasoning-wrap').show().prop('open', true);
+        }
+        $('#wizard-wb-stream-stats').text(`${cleanBody.length} 字符 · ${estimateTokens(cleanBody).toLocaleString()} tokens`);
+        if ($('#wizard-wb-stream-status').text().startsWith('连接中')) {
+            $('#wizard-wb-stream-status').text('生成中...').css('color', '#60a5fa');
+        }
+        if (wasAtBottom) bodyEl.scrollTop = bodyEl.scrollHeight;
+    }
+
+    function wbSendBtnState($btn, sending) {
+        if (sending) {
+            $btn.html('<i class="fa-solid fa-stop"></i> 停止').css({ background: 'rgba(248,113,113,0.15)', 'border-color': 'rgba(248,113,113,0.5)', color: '#f87171' });
+        } else {
+            $btn.html('<i class="fa-solid fa-paper-plane"></i> 发送').css({ background: 'rgba(var(--wizard-primary-rgb),0.18)', 'border-color': 'rgba(var(--wizard-primary-rgb),0.5)', color: 'var(--wizard-primary)' });
+        }
+    }
+
+    // ── 单条 AI 发送 ──
+    async function runWbSingle() {
+        if (wbAbortController) { wbAbortController.abort(); return; }
+        const p = buildWbSinglePayload();
+        if (!p) { toastr.warning('请先选择一个条目。'); return; }
+        const profile = $('#wizard-wb-profile').val() || "";
+        wbStreamMode = 'single';
+        $('#wizard-wb-stream-title').text('世界书 · 单条 AI 输出');
+        wbSendBtnState($('#wizard-wb-single-send-btn'), true);
+        $('#wizard-wb-single-status').text('正在发送给 AI…');
+        wbStreamResetUI();
+        $('#wizard-wb-stream-overlay').css('display', 'flex');
+        wbAbortController = new AbortController();
+        try {
+            const result = await runIsolatedFusionCall(
+                profile,
+                [{ role: 'user', content: p.userContent }],
+                p.systemPrompt,
+                0.3,
+                120000,
+                wbAbortController.signal,
+                wbStreamOnChunk
+            );
+            const { body: cleanedRaw, thinking: finishThinking } = splitInlineThinking((result || "").trim());
+            let raw = cleanedRaw.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+            $('#wizard-wb-stream-body').val(raw);
+            const thinking = ($('#wizard-wb-stream-reasoning').val() || '').trim() || finishThinking;
+            if (thinking) { $('#wizard-wb-stream-reasoning').val(thinking); $('#wizard-wb-stream-reasoning-wrap').show().prop('open', true); }
+            $('#wizard-wb-stream-stats').text(`${raw.length} 字符 · ${estimateTokens(raw).toLocaleString()} tokens`);
+            $('#wizard-wb-stream-status').text('生成完成').css('color', '#34d399');
+            $('#wizard-wb-stream-abort-btn').hide();
+            $('#wizard-wb-single-status').text('AI 已输出，请在窗口内确认后「应用」。');
+            // 自动保存 prompt/profile。
+            const mode = wbLastSingleMode;
+            config[`wbPrompt${mode.charAt(0).toUpperCase() + mode.slice(1)}`] = $('#wizard-wb-single-prompt').val() || "";
+            config.wbProfile = profile;
+            saveConfig(true);
+        } catch (e) {
+            if (e?.name === 'AbortError' || wbAbortController?.signal?.aborted) {
+                toastr.info('世界书单条修改已停止。');
+                $('#wizard-wb-single-status').text('已停止。');
+                $('#wizard-wb-stream-status').text('已中止').css('color', '#f59e0b');
+            } else {
+                toastr.error(`AI 请求失败: ${e.message}`);
+                $('#wizard-wb-single-status').text(`错误: ${e.message}`);
+                $('#wizard-wb-stream-status').text(`错误: ${e.message}`).css('color', '#ef4444');
+            }
+        } finally {
+            wbAbortController = null;
+            wbSendBtnState($('#wizard-wb-single-send-btn'), false);
+        }
+    }
+
+    // ── 多条 AI 发送 ──
+    async function runWbMulti() {
+        if (wbAbortController) { wbAbortController.abort(); return; }
+        const data = wbCache?.data;
+        if (!data) { toastr.warning('请先选择世界书。'); return; }
+        const p = buildWbMultiPayload();
+        if (!p) { toastr.warning('请先勾选至少一个条目。'); return; }
+        const toggles = {
+            allowChange: $('#wizard-wb-allow-change').attr('data-active') === 'true',
+            allowAdd: $('#wizard-wb-allow-add').attr('data-active') === 'true',
+            allowDeleteMerge: $('#wizard-wb-allow-delete-merge').attr('data-active') === 'true',
+        };
+        if (!toggles.allowChange && !toggles.allowAdd && !toggles.allowDeleteMerge) {
+            toastr.warning('请至少开启一个操作开关（修改/新增/删除合并）。');
+            return;
+        }
+        const profile = $('#wizard-wb-multi-profile').val() || "";
+        wbStreamMode = 'multi';
+        $('#wizard-wb-stream-title').text('世界书 · 多条 AI 输出');
+        wbSendBtnState($('#wizard-wb-multi-send-btn'), true);
+        $('#wizard-wb-multi-status').text('正在发送给 AI…');
+        wbStreamResetUI();
+        $('#wizard-wb-stream-overlay').css('display', 'flex');
+        wbAbortController = new AbortController();
+        try {
+            const result = await runIsolatedFusionCall(
+                profile,
+                [{ role: 'user', content: p.userContent }],
+                p.systemPrompt,
+                0.3,
+                180000,
+                wbAbortController.signal,
+                wbStreamOnChunk
+            );
+            const { body: cleanedRaw, thinking: finishThinking } = splitInlineThinking((result || "").trim());
+            let raw = cleanedRaw.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+            $('#wizard-wb-stream-body').val(raw);
+            $('#wizard-wb-stream-stats').text(`${raw.length} 字符 · ${estimateTokens(raw).toLocaleString()} tokens`);
+            $('#wizard-wb-stream-status').text('生成完成').css('color', '#34d399');
+            $('#wizard-wb-stream-abort-btn').hide();
+            const ops = processWbMultiOutput(raw, data, toggles);
+            if (!ops.length) {
+                $('#wizard-wb-multi-status').text('AI 未提出可用操作（或被开关全部丢弃）。');
+                return;
+            }
+            // 暂存待确认操作并渲染行。
+            $('.wizard-wb-op-row').remove();
+            wbPendingOps.clear();
+            ops.forEach((op, i) => insertWbOpRow(op, i));
+            $('#wizard-wb-multi-status').text(`已收到 ${ops.length} 条建议，请在条目列表下方逐条确认或「全部应用」。`);
+            config.wbMultiProfile = profile;
+            config.wbMultiPrompt = $('#wizard-wb-multi-prompt').val() || "";
+            config.wbAllowChangeExisting = toggles.allowChange;
+            config.wbAllowAddNew = toggles.allowAdd;
+            config.wbAllowDeleteMerge = toggles.allowDeleteMerge;
+            saveConfig(true);
+        } catch (e) {
+            if (e?.name === 'AbortError' || wbAbortController?.signal?.aborted) {
+                toastr.info('世界书多条修改已停止。');
+                $('#wizard-wb-multi-status').text('已停止。');
+                $('#wizard-wb-stream-status').text('已中止').css('color', '#f59e0b');
+            } else {
+                toastr.error(`AI 请求失败: ${e.message}`);
+                $('#wizard-wb-multi-status').text(`错误: ${e.message}`);
+                $('#wizard-wb-stream-status').text(`错误: ${e.message}`).css('color', '#ef4444');
+            }
+        } finally {
+            wbAbortController = null;
+            wbSendBtnState($('#wizard-wb-multi-send-btn'), false);
+        }
+    }
+
+    // ── 刷新条目列表（保存后调用）──
+    async function refreshWbEntryList() {
+        if (!wbSelectedBook) return;
+        const data = await loadWbData(wbSelectedBook); // 缓存已失效会重新读取
+        if (data) renderWbEntryList(data);
+    }
+
+    // ── 切换面板显隐 ──
+    function setWbPanelVisible(visible) {
+        const $panel = $('#wizard-wb-panel');
+        const $editor = $('#wizard-node-form-panel');
+        const $btn = $('#wizard-tree-worldbook-btn');
+        if (visible) {
+            $editor.css('display', 'none');
+            $panel.css('display', 'flex');
+            $btn.addClass('wizard-btn-warning');
+            focusWbPanelIfMobile();
+            startWbOverflowObserver();
+            // 默认末尾楼层 = 当前楼层号。
+            const cur = getCurrentFloorNumber();
+            if (cur >= 0) {
+                if (!$('#wizard-wb-single-floor-end').val()) $('#wizard-wb-single-floor-end').val(cur);
+                if (!$('#wizard-wb-multi-floor-end').val()) $('#wizard-wb-multi-floor-end').val(cur);
+            }
+            (async () => {
+                await renderWbBookSelector();
+                if (wbSelectedBook) {
+                    const data = await loadWbData(wbSelectedBook);
+                    renderWbEntryList(data);
+                }
+                updateWbSingleTokenStats();
+                updateWbMultiTokenStats();
+                requestAnimationFrame(recheckWbOverflow);
+            })();
+        } else {
+            $panel.css('display', 'none');
+            $editor.css('display', '');
+            $btn.removeClass('wizard-btn-warning');
+            stopWbOverflowObserver();
+        }
+    }
+
+    // ── 事件绑定 ──
+    $(document).off('click', '#wizard-tree-worldbook-btn').on('click', '#wizard-tree-worldbook-btn', function () {
+        const visible = $('#wizard-wb-panel').css('display') !== 'none';
+        setWbPanelVisible(!visible);
+    });
+
+    $(document).off('click', '#wizard-wb-refresh-btn').on('click', '#wizard-wb-refresh-btn', async function () {
+        wbCache = null;
+        await renderWbBookSelector();
+        if (wbSelectedBook) { const d = await loadWbData(wbSelectedBook); renderWbEntryList(d); }
+        toastr.info('世界书列表已刷新。');
+    });
+
+    $(document).off('click', '#wizard-wb-open-editor-btn').on('click', '#wizard-wb-open-editor-btn', function () {
+        const ctx = wbCtx();
+        if (!ctx || !wbSelectedBook) return;
+        try {
+            if (typeof ctx.openWorldInfoEditor === 'function') ctx.openWorldInfoEditor(wbSelectedBook);
+            else if (typeof ctx.showWorldEditor === 'function') ctx.showWorldEditor(wbSelectedBook);
+            else if (typeof ctx.reloadWorldInfoEditor === 'function') ctx.reloadWorldInfoEditor(wbSelectedBook, true);
+            else toastr.warning('当前 SillyTavern 未暴露世界书编辑器接口。');
+        } catch (e) { toastr.error(`打开编辑器失败: ${e.message}`); }
+    });
+
+    $(document).off('change', '#wizard-wb-select').on('change', '#wizard-wb-select', async function () {
+        wbSelectedBook = $(this).val() || "";
+        wbSelectedUid = null;
+        wbMultiSelectedUids.clear();
+        wbCache = null;
+        if (wbSelectedBook) {
+            const data = await loadWbData(wbSelectedBook);
+            renderWbEntryList(data);
+            setWbSingleTarget(null);
+        } else {
+            renderWbEntryList(null);
+        }
+        config.wbSelectedBook = wbSelectedBook;
+        saveConfig(true);
+        updateWbSingleTokenStats();
+        updateWbMultiTokenStats();
+    });
+
+    $(document).off('change', '#wizard-wb-follow-char').on('change', '#wizard-wb-follow-char', async function () {
+        config.wbFollowCharBook = $(this).prop('checked');
+        saveConfig(true);
+        await renderWbBookSelector();
+        if (wbSelectedBook) { const d = await loadWbData(wbSelectedBook); renderWbEntryList(d); }
+    });
+
+    // 条目点击：单条模式选中目标；checkbox：多条勾选。
+    $(document).off('click', '.wizard-wb-entry-row').on('click', '.wizard-wb-entry-row', async function (e) {
+        if ($(e.target).is('.wizard-wb-entry-checkbox')) return; // 复选框单独处理
+        const uid = Number($(this).data('uid'));
+        const data = wbCache?.data;
+        if (!data) return;
+        const entry = findEntry(data, uid);
+        if (!entry) return;
+        setWbSingleTarget(entry);
+        $('.wizard-wb-entry-row').removeClass('wizard-wb-selected');
+        $(this).addClass('wizard-wb-selected');
+        updateWbSingleTokenStats();
+    });
+
+    $(document).off('change', '.wizard-wb-entry-checkbox').on('change', '.wizard-wb-entry-checkbox', function () {
+        const uid = Number($(this).data('uid'));
+        if (this.checked) wbMultiSelectedUids.add(uid); else wbMultiSelectedUids.delete(uid);
+        updateWbMultiCount();
+        updateWbMultiTokenStats();
+    });
+
+    $(document).off('click', '#wizard-wb-select-all').on('click', '#wizard-wb-select-all', function () {
+        const arr = wbEntryArr(wbCache?.data);
+        arr.forEach(({ entry }) => wbMultiSelectedUids.add(entry.uid));
+        $('.wizard-wb-entry-checkbox').prop('checked', true);
+        updateWbMultiCount();
+        updateWbMultiTokenStats();
+    });
+
+    $(document).off('click', '#wizard-wb-select-none').on('click', '#wizard-wb-select-none', function () {
+        wbMultiSelectedUids.clear();
+        $('.wizard-wb-entry-checkbox').prop('checked', false);
+        updateWbMultiCount();
+        updateWbMultiTokenStats();
+    });
+
+    // 模式 tab。
+    $(document).off('click', '.wizard-wb-mode-tab').on('click', '.wizard-wb-mode-tab', function () {
+        const which = $(this).attr('id') === 'wizard-wb-tab-single' ? 'single' : 'multi';
+        $('.wizard-wb-mode-tab').attr('data-active', 'false');
+        $(this).attr('data-active', 'true');
+        if (which === 'single') {
+            $('#wizard-wb-single-panel').css('display', 'flex');
+            $('#wizard-wb-multi-panel').css('display', 'none');
+            updateWbSingleTokenStats();
+        } else {
+            $('#wizard-wb-single-panel').css('display', 'none');
+            $('#wizard-wb-multi-panel').css('display', 'flex');
+            updateWbMultiTokenStats();
+        }
+        requestAnimationFrame(recheckWbOverflow);
+    });
+
+    // 单条预设：切换前先把当前文本框内容存回当前预设，避免编辑丢失。
+    $(document).off('click', '.wizard-wb-preset').on('click', '.wizard-wb-preset', function () {
+        const newMode = $(this).data('mode');
+        const oldMode = wbLastSingleMode || 'reduce';
+        if (oldMode !== newMode) {
+            const oldDef = oldMode === 'reduce' ? DEFAULT_WB_PROMPT_REDUCE : oldMode === 'complete' ? DEFAULT_WB_PROMPT_COMPLETE : DEFAULT_WB_PROMPT_REWRITE;
+            const normOld = (v, def) => { const s = (v || '').trim(); return (!s || s === def.trim()) ? "" : s; };
+            config[`wbPrompt${oldMode.charAt(0).toUpperCase() + oldMode.slice(1)}`] = normOld($('#wizard-wb-single-prompt').val(), oldDef);
+        }
+        wbLastSingleMode = newMode;
+        $('.wizard-wb-preset').removeClass('wizard-wb-preset-active');
+        $(this).addClass('wizard-wb-preset-active');
+        const def = newMode === 'reduce' ? DEFAULT_WB_PROMPT_REDUCE : newMode === 'complete' ? DEFAULT_WB_PROMPT_COMPLETE : DEFAULT_WB_PROMPT_REWRITE;
+        const saved = config[`wbPrompt${newMode.charAt(0).toUpperCase() + newMode.slice(1)}`] || "";
+        $('#wizard-wb-single-prompt').val(saved || def);
+        config.wbLastSingleMode = newMode;
+        saveConfig(true);
+        updateWbSingleTokenStats();
+    });
+
+    // 宏标签点击 → 插入到聚焦输入框。
+    $(document).off('click', '.wizard-wb-chip').on('click', '.wizard-wb-chip', function () {
+        const token = $(this).data('token');
+        const $focused = $(document.activeElement);
+        if (!$focused.is('textarea')) {
+            // 默认插入到单条 prompt（或多条，视当前可见面板）。
+            const $tgt = $('#wizard-wb-multi-panel').css('display') !== 'none' ? $('#wizard-wb-multi-prompt') : $('#wizard-wb-single-prompt');
+            insertWbTokenAtCursor($tgt, token);
+        } else {
+            insertWbTokenAtCursor($focused, token);
+        }
+    });
+
+    function insertWbTokenAtCursor($ta, token) {
+        const el = $ta[0];
+        if (!el) return;
+        const start = el.selectionStart ?? el.value.length;
+        const end = el.selectionEnd ?? el.value.length;
+        el.value = el.value.slice(0, start) + token + el.value.slice(end);
+        el.selectionStart = el.selectionEnd = start + token.length;
+        $ta.trigger('input');
+    }
+
+    // 输入变化 → 更新 token / 保存 prompt。
+    $(document).off('input', '#wizard-wb-single-prompt').on('input', '#wizard-wb-single-prompt', () => updateWbSingleTokenStats());
+    $(document).off('input', '#wizard-wb-multi-prompt').on('input', '#wizard-wb-multi-prompt', () => updateWbMultiTokenStats());
+    $(document).off('input change', '.wizard-wb-floor').on('input change', '.wizard-wb-floor', function () {
+        updateWbSingleTokenStats();
+        updateWbMultiTokenStats();
+    });
+    $(document).off('change', '#wizard-wb-profile').on('change', '#wizard-wb-profile', function () { config.wbProfile = $(this).val() || ""; saveConfig(true); });
+    $(document).off('change', '#wizard-wb-multi-profile').on('change', '#wizard-wb-multi-profile', function () { config.wbMultiProfile = $(this).val() || ""; saveConfig(true); });
+
+    // 开关（修改/新增/删除合并）。
+    $(document).off('click', '.wizard-wb-toggle').on('click', '.wizard-wb-toggle', function () {
+        const cur = $(this).attr('data-active') === 'true';
+        $(this).attr('data-active', String(!cur));
+        const id = $(this).attr('id');
+        if (id === 'wizard-wb-allow-change') config.wbAllowChangeExisting = !cur;
+        else if (id === 'wizard-wb-allow-add') config.wbAllowAddNew = !cur;
+        else if (id === 'wizard-wb-allow-delete-merge') config.wbAllowDeleteMerge = !cur;
+        saveConfig(true);
+    });
+
+    // 发送按钮。
+    $(document).off('click', '#wizard-wb-single-send-btn').on('click', '#wizard-wb-single-send-btn', runWbSingle);
+    $(document).off('click', '#wizard-wb-multi-send-btn').on('click', '#wizard-wb-multi-send-btn', runWbMulti);
+    $(document).off('click', '#wizard-wb-single-stream-view-btn').on('click', '#wizard-wb-single-stream-view-btn', function () {
+        wbStreamMode = 'single'; $('#wizard-wb-stream-title').text('世界书 · 单条 AI 输出');
+        $('#wizard-wb-stream-overlay').css('display', 'flex');
+    });
+    $(document).off('click', '#wizard-wb-multi-stream-view-btn').on('click', '#wizard-wb-multi-stream-view-btn', function () {
+        wbStreamMode = 'multi'; $('#wizard-wb-stream-title').text('世界书 · 多条 AI 输出');
+        $('#wizard-wb-stream-overlay').css('display', 'flex');
+    });
+
+    // 流式窗口按钮。
+    $(document).off('click', '#wizard-wb-stream-close-btn').on('click', '#wizard-wb-stream-close-btn', function () { $('#wizard-wb-stream-overlay').css('display', 'none'); });
+    $(document).off('click', '#wizard-wb-stream-abort-btn').on('click', '#wizard-wb-stream-abort-btn', function () { if (wbAbortController) wbAbortController.abort(); });
+    $(document).off('click', '#wizard-wb-stream-clear-btn').on('click', '#wizard-wb-stream-clear-btn', function () {
+        $('#wizard-wb-stream-body').val(''); $('#wizard-wb-stream-reasoning').val('');
+        $('#wizard-wb-stream-reasoning-wrap').hide().prop('open', false);
+        $('#wizard-wb-stream-stats').text('0 字符 · 0 tokens'); $('#wizard-wb-stream-status').text('已清空').css('color', '#9ca3af');
+    });
+    $(document).off('click', '#wizard-wb-stream-copy-btn').on('click', '#wizard-wb-stream-copy-btn', async function () {
+        try { await navigator.clipboard.writeText($('#wizard-wb-stream-body').val() || ''); toastr.success('已复制。'); } catch (_) { toastr.error('复制失败。'); }
+    });
+    $(document).off('click', '#wizard-wb-stream-apply-btn').on('click', '#wizard-wb-stream-apply-btn', async function () {
+        const text = $('#wizard-wb-stream-body').val() || '';
+        if (!text.trim()) { toastr.warning('实时输出为空，无法应用。'); return; }
+        if (wbStreamMode === 'single') {
+            const data = wbCache?.data;
+            const entry = (data && wbSelectedUid != null) ? findEntry(data, wbSelectedUid) : null;
+            if (!entry) { toastr.warning('未选择目标条目。'); return; }
+            const newFields = processWbSingleOutput(text, entry);
+            const ok = await applyWbSingle(entry, newFields);
+            if (ok) {
+                toastr.success(`已应用：#${entry.uid} ${entry.comment || ''}`);
+                $('#wizard-wb-single-status').text('已应用。');
+                $('#wizard-wb-stream-overlay').css('display', 'none');
+            }
+        } else {
+            // multi: 重新解析并直接应用（流式窗口「应用」= 全部应用）。
+            const toggles = {
+                allowChange: $('#wizard-wb-allow-change').attr('data-active') === 'true',
+                allowAdd: $('#wizard-wb-allow-add').attr('data-active') === 'true',
+                allowDeleteMerge: $('#wizard-wb-allow-delete-merge').attr('data-active') === 'true',
+            };
+            const ops = processWbMultiOutput(text, wbCache?.data || { entries: {} }, toggles);
+            if (!ops.length) { toastr.warning('没有可应用的操作。'); return; }
+            const n = await applyWbOps(ops);
+            if (n > 0) {
+                toastr.success(`已应用 ${n} 条操作。`);
+                $('#wizard-wb-multi-status').text(`已应用 ${n} 条操作。`);
+                $('.wizard-wb-op-row').remove(); wbPendingOps.clear(); updateWbOpsBulkBar();
+                $('#wizard-wb-stream-overlay').css('display', 'none');
+            }
+        }
+    });
+
+    // 多条待确认行：逐条应用/丢弃。
+    $(document).off('click', '.wizard-wb-op-accept').on('click', '.wizard-wb-op-accept', async function () {
+        const key = $(this).data('key');
+        const op = wbPendingOps.get(key);
+        if (!op) return;
+        const n = await applyWbOps([op]);
+        if (n > 0) { toastr.success('已应用该操作。'); }
+        wbPendingOps.delete(key);
+        $(`.wizard-wb-op-row[data-key="${escapeHtml(key)}"]`).remove();
+        updateWbOpsBulkBar();
+    });
+    $(document).off('click', '.wizard-wb-op-reject').on('click', '.wizard-wb-op-reject', function () {
+        const key = $(this).data('key');
+        wbPendingOps.delete(key);
+        $(`.wizard-wb-op-row[data-key="${escapeHtml(key)}"]`).remove();
+        updateWbOpsBulkBar();
+    });
+    $(document).off('click', '#wizard-wb-ops-accept-all-btn').on('click', '#wizard-wb-ops-accept-all-btn', async function () {
+        if (!wbPendingOps.size) return;
+        const ops = Array.from(wbPendingOps.values());
+        const n = await applyWbOps(ops);
+        if (n > 0) toastr.success(`已应用 ${n} 条操作。`);
+        wbPendingOps.clear(); $('.wizard-wb-op-row').remove(); updateWbOpsBulkBar();
+        $('#wizard-wb-multi-status').text(`已应用 ${n} 条操作。`);
+    });
+    $(document).off('click', '#wizard-wb-ops-reject-all-btn').on('click', '#wizard-wb-ops-reject-all-btn', function () {
+        wbPendingOps.clear(); $('.wizard-wb-op-row').remove(); updateWbOpsBulkBar();
+        toastr.info('已丢弃全部建议。');
+    });
+
+    // 撤回。
+    $(document).off('click', '#wizard-wb-undo-btn').on('click', '#wizard-wb-undo-btn', undoWb);
+
+    // 自定义 Prompt 编辑器。
+    $(document).off('click', '#wizard-wb-prompt-edit-btn').on('click', '#wizard-wb-prompt-edit-btn', function () {
+        $('#wizard-wb-prompt-reduce').val(config.wbPromptReduce || DEFAULT_WB_PROMPT_REDUCE);
+        $('#wizard-wb-prompt-complete').val(config.wbPromptComplete || DEFAULT_WB_PROMPT_COMPLETE);
+        $('#wizard-wb-prompt-rewrite').val(config.wbPromptRewrite || DEFAULT_WB_PROMPT_REWRITE);
+        $('#wizard-wb-prompt-multi').val(config.wbPromptMulti || DEFAULT_WB_PROMPT_MULTI);
+        $('#wizard-wb-prompt-editor-overlay').css('display', 'flex');
+    });
+    $(document).off('click', '#wizard-wb-prompt-editor-close').on('click', '#wizard-wb-prompt-editor-close', function () { $('#wizard-wb-prompt-editor-overlay').css('display', 'none'); });
+    $(document).off('click', '#wizard-wb-prompt-editor-cancel').on('click', '#wizard-wb-prompt-editor-cancel', function () { $('#wizard-wb-prompt-editor-overlay').css('display', 'none'); });
+    $(document).off('click', '#wizard-wb-prompt-editor-save').on('click', '#wizard-wb-prompt-editor-save', function () {
+        const norm = (v, def) => { const s = (v || '').trim(); return (!s || s === def.trim()) ? "" : s; };
+        config.wbPromptReduce = norm($('#wizard-wb-prompt-reduce').val(), DEFAULT_WB_PROMPT_REDUCE);
+        config.wbPromptComplete = norm($('#wizard-wb-prompt-complete').val(), DEFAULT_WB_PROMPT_COMPLETE);
+        config.wbPromptRewrite = norm($('#wizard-wb-prompt-rewrite').val(), DEFAULT_WB_PROMPT_REWRITE);
+        config.wbPromptMulti = norm($('#wizard-wb-prompt-multi').val(), DEFAULT_WB_PROMPT_MULTI);
+        saveConfig(true);
+        // 若当前单条面板正在显示某预设，刷新其文本框。
+        const m = wbLastSingleMode;
+        const saved = config[`wbPrompt${m.charAt(0).toUpperCase() + m.slice(1)}`] || "";
+        const def = m === 'reduce' ? DEFAULT_WB_PROMPT_REDUCE : m === 'complete' ? DEFAULT_WB_PROMPT_COMPLETE : DEFAULT_WB_PROMPT_REWRITE;
+        $('#wizard-wb-single-prompt').val(saved || def);
+        $('#wizard-wb-multi-prompt').val(config.wbPromptMulti || DEFAULT_WB_PROMPT_MULTI);
+        $('#wizard-wb-prompt-editor-overlay').css('display', 'none');
+        toastr.success('世界书 Prompts 已保存。');
+        updateWbSingleTokenStats();
+        updateWbMultiTokenStats();
+    });
+
+    // ── WORLDINFO_UPDATED / CHAT_CHANGED 钩子 ──
+    // registerWbEventHooks 定义在 registerNodeFormListeners 作用域内，故在此处（同一作用域）调用一次即可。
+    function registerWbEventHooks() {
+        try {
+            const ctx = window.SillyTavern.getContext();
+            const es = ctx?.eventSource;
+            const et = ctx?.eventTypes;
+            if (!es || !et) return;
+            if (et.WORLDINFO_UPDATED) {
+                es.on(et.WORLDINFO_UPDATED, () => {
+                    wbCache = null;
+                    if (wbSelectedBook) { (async () => { const d = await loadWbData(wbSelectedBook); renderWbEntryList(d); })(); }
+                });
+            }
+            if (et.CHAT_CHANGED) {
+                es.on(et.CHAT_CHANGED, () => {
+                    // 面板可见时：切换角色后重新检测绑定书、刷新选择器与条目，并把末尾楼层默认到当前楼层号。
+                    if ($('#wizard-wb-panel').css('display') === 'none') return;
+                    (async () => {
+                        try {
+                            await renderWbBookSelector();
+                            if (wbSelectedBook) { const d = await loadWbData(wbSelectedBook); renderWbEntryList(d); }
+                            const cur = getCurrentFloorNumber();
+                            if (cur >= 0) {
+                                $('#wizard-wb-single-floor-end').val(cur);
+                                $('#wizard-wb-multi-floor-end').val(cur);
+                            }
+                        } catch (e) { writeLog(`WB chat-change refresh failed: ${e.message}`, 'ERROR'); }
+                    })();
+                });
+            }
+        } catch (e) { writeLog(`WB event hooks failed: ${e.message}`, 'ERROR'); }
+    }
+    registerWbEventHooks();
+
+    // ─── End World Book ────────────────────────────────────────────────────
+
     // Move summary item up
     $(document).off('click', '.wizard-move-up-summary-btn').on('click', '.wizard-move-up-summary-btn', async function () {
         const type = $(this).data('type');
@@ -12831,6 +14161,14 @@ function registerNodeFormListeners() {
         $(this).attr('data-active', next ? 'true' : 'false');
         config.summaryDefaultShowRealTime = next;
         saveConfig(true);
+    });
+
+    // 保留条数语义切换：外加(阈值之外) <-> 包含(阈值之内)。进度条门槛随之改变。
+    $(document).off('click.wizardKeepLatestInc', '#wizard-keep-latest-inclusive').on('click.wizardKeepLatestInc', '#wizard-keep-latest-inclusive', function () {
+        config.keepLatestInclusive = $(this).attr('data-active') !== 'true';
+        renderKeepLatestToggle();
+        saveConfig(true);
+        updateSummaryProgress();
     });
 
     $(document).off('click', '#wizard-sum-remap-floors-btn').on('click', '#wizard-sum-remap-floors-btn', function () {

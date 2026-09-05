@@ -734,8 +734,35 @@ input:checked + .wizard-slider:before {
 /* Both columns inherit the row height so their internal scroll kicks in. The
    flex-wrap fallback (narrow widths) is preserved by the inline min-width. */
 #wizard-tab-tree.active > .wizard-tree-row > .wizard-tree-list-col,
-#wizard-tab-tree.active > .wizard-tree-row > .wizard-node-editor {
+#wizard-tab-tree.active > .wizard-tree-row > .wizard-node-editor,
+#wizard-tab-tree.active > .wizard-tree-row > #wizard-wb-panel {
     max-height: 100%;
+    min-height: 0;
+}
+
+#wizard-wb-panel {
+    overflow-y: auto;
+    scrollbar-gutter: stable;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(var(--wizard-primary-rgb), 0.45) transparent;
+}
+
+#wizard-wb-panel::-webkit-scrollbar {
+    width: 8px;
+}
+
+#wizard-wb-panel::-webkit-scrollbar-thumb {
+    background: rgba(var(--wizard-primary-rgb), 0.45);
+    border-radius: 999px;
+}
+
+#wizard-wb-panel::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+#wizard-wb-panel.wizard-wb-overflowing {
+    overflow-y: scroll !important;
+    border-color: rgba(var(--wizard-primary-rgb), 0.42);
 }
 
 @media (max-width: 768px), (pointer: coarse) {
@@ -751,7 +778,8 @@ input:checked + .wizard-slider:before {
     }
 
     #wizard-tab-tree.active > .wizard-tree-row > .wizard-tree-list-col,
-    #wizard-tab-tree.active > .wizard-tree-row > .wizard-node-editor {
+    #wizard-tab-tree.active > .wizard-tree-row > .wizard-node-editor,
+    #wizard-tab-tree.active > .wizard-tree-row > #wizard-wb-panel {
         flex: 0 0 auto !important;
         min-width: 0 !important;
         width: 100% !important;
@@ -945,3 +973,27 @@ input:checked + .wizard-slider:before {
     border-top: 1px solid rgba(255, 255, 255, 0.1);
     padding-top: 8px;
 }
+
+
+/* ── World Book panel ── */
+.wizard-wb-chip { cursor: pointer; background: rgba(var(--wizard-primary-rgb),0.15); border: 1px solid rgba(var(--wizard-primary-rgb),0.4); color: var(--wizard-primary); padding: 1px 6px; border-radius: 4px; font-family: monospace; font-size: 0.85em; display: inline-block; margin: 2px 0; }
+.wizard-wb-chip:hover { background: rgba(var(--wizard-primary-rgb),0.28); }
+.wizard-wb-entry-row { display: flex; align-items: flex-start; gap: 6px; padding: 4px 6px; border-radius: 4px; cursor: pointer; border: 1px solid transparent; margin-bottom: 2px; }
+.wizard-wb-entry-row:hover { background: rgba(var(--wizard-primary-rgb),0.08); }
+.wizard-wb-entry-row.wizard-wb-selected { background: rgba(var(--wizard-primary-rgb),0.16); border-color: rgba(var(--wizard-primary-rgb),0.45); }
+.wizard-wb-entry-row.wizard-wb-disabled { opacity: 0.5; }
+.wizard-wb-entry-main { flex: 1; min-width: 0; }
+.wizard-wb-entry-title { font-weight: 600; color: #e5e7eb; word-break: break-word; }
+.wizard-wb-entry-keys { font-size: 0.78em; color: #9ca3af; word-break: break-word; }
+.wizard-wb-entry-badges { font-size: 0.7em; display: flex; gap: 4px; flex-wrap: wrap; margin-top: 2px; }
+.wizard-wb-badge { padding: 0 4px; border-radius: 3px; border: 1px solid rgba(255,255,255,0.18); color: #d1d5db; }
+.wizard-wb-badge-const { background: rgba(96,165,250,0.18); border-color: rgba(96,165,250,0.5); color: #93c5fd; }
+.wizard-wb-badge-off { background: rgba(239,68,68,0.12); border-color: rgba(239,68,68,0.4); color: #f87171; }
+.wizard-wb-mode-tab[data-active="true"] { background: rgba(var(--wizard-primary-rgb),0.2) !important; border-color: rgba(var(--wizard-primary-rgb),0.6) !important; color: var(--wizard-primary) !important; }
+.wizard-wb-preset.wizard-wb-preset-active { background: rgba(var(--wizard-primary-rgb),0.25) !important; border-color: rgba(var(--wizard-primary-rgb),0.6) !important; color: var(--wizard-primary) !important; }
+.wizard-wb-op-row { margin: 4px 0; padding: 6px; border: 1px solid rgba(52,211,153,0.4); border-radius: 6px; background: rgba(52,211,153,0.06); }
+.wizard-wb-op-head { display: flex; align-items: center; gap: 6px; font-size: 0.78em; color: #34d399; margin-bottom: 4px; }
+.wizard-wb-op-diff { display: flex; gap: 8px; font-size: 0.78em; }
+.wizard-wb-op-col { flex: 1; min-width: 0; white-space: pre-wrap; word-break: break-word; background: rgba(0,0,0,0.25); padding: 4px 6px; border-radius: 4px; max-height: 120px; overflow-y: auto; }
+.wizard-wb-op-actions { display: flex; gap: 6px; margin-top: 4px; }
+.wizard-wb-empty { color: #6b7280; padding: 8px; text-align: center; font-size: 0.8em; }

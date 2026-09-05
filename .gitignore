@@ -13,6 +13,12 @@ Backups/
 # 网关本地运行设置（含用户选定的渠道/上游配置）
 gateway/gateway-settings.json
 
+# 网关请求抓包（含完整 system prompt 与对话正文，属隐私数据）
+cap*.json
+
+# 本地工具输出
+graphify-out/
+
 # Claude Code 本地设置
 .claude/
 
