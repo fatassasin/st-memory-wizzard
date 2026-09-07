@@ -997,3 +997,45 @@ input:checked + .wizard-slider:before {
 .wizard-wb-op-col { flex: 1; min-width: 0; white-space: pre-wrap; word-break: break-word; background: rgba(0,0,0,0.25); padding: 4px 6px; border-radius: 4px; max-height: 120px; overflow-y: auto; }
 .wizard-wb-op-actions { display: flex; gap: 6px; margin-top: 4px; }
 .wizard-wb-empty { color: #6b7280; padding: 8px; text-align: center; font-size: 0.8em; }
+
+/* ===== 关键词搜索框内嵌清除红叉 =====
+   红叉压在输入框右内侧（无边框），靠 :placeholder-shown 判断有无输入：
+   输入框为空时占位符可见 -> 隐藏红叉，输入后占位符消失 -> 红叉出现。
+   纯 CSS 判断，无需在每个给输入框赋值的地方再同步一次按钮状态。 */
+.wizard-kw-search-wrap {
+    position: relative;
+    display: flex;
+    align-items: center;
+    flex: 1;
+    min-width: 160px;
+}
+
+.wizard-kw-search-wrap > input {
+    width: 100%;
+    /* 没有全局 box-sizing 重置，不加这行 width:100% 会被内边距撑出 wrap 之外。 */
+    box-sizing: border-box;
+    /* .wizard-input 的 padding 是 !important，右内边距要以更高优先级让位给红叉。 */
+    padding-right: 26px !important;
+}
+
+#wizard-sandbox-keyword-clear {
+    position: absolute;
+    right: 4px;
+    background: none;
+    border: none;
+    padding: 2px 4px;
+    color: #f87171;
+    font-size: 0.9em;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0.7;
+    transition: opacity 0.15s ease;
+}
+
+#wizard-sandbox-keyword-clear:hover {
+    opacity: 1;
+}
+
+.wizard-kw-search-wrap > input:placeholder-shown + #wizard-sandbox-keyword-clear {
+    display: none;
+}

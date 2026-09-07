@@ -9008,7 +9008,7 @@ function renderSandboxChat() {
         }
 
         html += `
-            <div class="wizard-context-msg-item" style="border: 1px solid ${itemBorder}; ${coverageBorder} padding: 8px; border-radius: 6px; background: ${itemBg}; display: flex; flex-direction: column; gap: 4px;">
+            <div class="wizard-context-msg-item" data-floor="${floorId}" style="border: 1px solid ${itemBorder}; ${coverageBorder} padding: 8px; border-radius: 6px; background: ${itemBg}; display: flex; flex-direction: column; gap: 4px;">
                 <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.85em; color: ${headerColor}; font-weight: 500;">
                     <span>#${floorId} (楼层) - ${escapeHtml(name)} (${roleLabel})${passBadge}</span>
                     <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: flex-end;">
@@ -9054,6 +9054,67 @@ function renderSandboxChat() {
 
     // Update context stats summary in the fusion status bar.
     updateFusionTokenStats();
+}
+
+// Scroll a floor element to the vertical centre of the floor list. Container-relative
+// on purpose: scrollIntoView({block:'center'}) would also scroll the modal behind it.
+function centerSandboxFloorEl(list, el) {
+    const rel = (el.getBoundingClientRect().top - list.getBoundingClientRect().top) + list.scrollTop;
+    list.scrollTop = Math.max(0, rel - (list.clientHeight / 2) + (el.offsetHeight / 2));
+}
+
+// Scroll the floor holding the MIDDLE keyword hit to the vertical centre of the floor
+// list. Centring the middle match rather than the first leaves matched floors both
+// above and below in view, so after a search you can walk the neighbouring floors for
+// related context instead of being parked at the top of the list with nothing above.
+function centerMiddleKeywordHit() {
+    const list = document.getElementById('wizard-context-editor-list');
+    if (!list) return;
+    const hits = Array.from(list.querySelectorAll('.wizard-context-msg-item'))
+        .filter(el => el.querySelector('.wizard-kw-hit'));
+    if (!hits.length) return;
+    centerSandboxFloorEl(list, hits[Math.floor((hits.length - 1) / 2)]);
+}
+
+// The floor number currently sitting closest to the vertical middle of the floor list,
+// or null when nothing is rendered. Used to anchor the view across a re-render that
+// changes the filter: the filtered and unfiltered lists have wildly different lengths,
+// so keeping the raw scroll offset would land on a completely unrelated floor.
+function centeredSandboxFloor() {
+    const list = document.getElementById('wizard-context-editor-list');
+    if (!list) return null;
+    const mid = list.getBoundingClientRect().top + (list.clientHeight / 2);
+    let best = null, bestDist = Infinity;
+    for (const el of list.querySelectorAll('.wizard-context-msg-item')) {
+        const r = el.getBoundingClientRect();
+        const d = Math.abs((r.top + r.height / 2) - mid);
+        if (d < bestDist) { bestDist = d; best = el; }
+    }
+    if (!best) return null;
+    const floor = parseInt(best.dataset.floor);
+    return isNaN(floor) ? null : floor;
+}
+
+// Switch to the page holding `floor` in the CURRENT filter set, re-render, then centre
+// and briefly flash that floor. Returns false without rendering when the floor is not
+// in the filtered set, so callers can fall back to a plain render.
+// Shared by 跳至第 X 楼 and by clearing the keyword filter.
+function jumpToSandboxFloor(floor) {
+    const entries = getFilteredSandboxEntries();
+    const pos = entries.findIndex(en => en.floor === floor);
+    if (pos < 0) return false;
+    sandboxPage = Math.floor(pos / SANDBOX_PAGE_SIZE);
+    renderSandboxChat();
+    const list = document.getElementById('wizard-context-editor-list');
+    const item = list && list.querySelector(`.wizard-context-msg-item[data-floor="${floor}"]`);
+    if (item) {
+        centerSandboxFloorEl(list, item);
+        const $row = $(item);
+        const orig = $row.css('box-shadow');
+        $row.css('box-shadow', '0 0 0 2px #60a5fa');
+        setTimeout(() => $row.css('box-shadow', orig), 1200);
+    }
+    return true;
 }
 
 // Default fusion system prompts (shared by the generator and the token estimator so
@@ -10294,19 +10355,31 @@ function registerNodeFormListeners() {
     });
 
     // Keyword filter: applies LIVE on every keystroke (Ctrl+F style) — no need to
-    // click 添加筛选. Highlights matches in orange and scrolls the first match to
-    // the centre of the list. Also persisted.
+    // click 添加筛选. Highlights matches in orange and centres the middle matched
+    // floor in the list. Also persisted.
     $(document).off('input', '#wizard-sandbox-keyword').on('input', '#wizard-sandbox-keyword', function () {
         config.sandboxKeyword = $(this).val();
         sandboxPage = 0;
         renderSandboxChat();
-        // After render, scroll the first highlighted match into the middle of the list.
-        // (renderSandboxChat already centered the mark inside each preview box.)
-        const first = document.querySelector('#wizard-context-editor-list .wizard-kw-hit');
-        if (first) first.scrollIntoView({ block: 'center' });
+        // renderSandboxChat already centred the mark inside each preview box; this
+        // additionally centres the whole floor so its neighbours are reachable.
+        centerMiddleKeywordHit();
     });
     $(document).off('change', '#wizard-sandbox-keyword').on('change', '#wizard-sandbox-keyword', function () {
         config.sandboxKeyword = $(this).val();
+        saveConfig(true);
+    });
+
+    // Red X inside the keyword box: clear the search in one click. The floor at the
+    // centre of the view is captured first and re-centred afterwards — dropping the
+    // filter makes the list far longer, so without an anchor the same scroll offset
+    // lands on an unrelated floor and you lose the one you just searched for.
+    $(document).off('click', '#wizard-sandbox-keyword-clear').on('click', '#wizard-sandbox-keyword-clear', function () {
+        const anchor = centeredSandboxFloor();
+        $('#wizard-sandbox-keyword').val('').focus();
+        config.sandboxKeyword = '';
+        sandboxPage = 0;
+        if (anchor === null || !jumpToSandboxFloor(anchor)) renderSandboxChat();
         saveConfig(true);
     });
 
@@ -10340,7 +10413,7 @@ function registerNodeFormListeners() {
         sandboxMatchMode = mode;
         $('.wizard-sandbox-mode-input').hide();
         if (mode === 'regex') { $('#wizard-sandbox-regex').css('display', ''); $('.wizard-sandbox-regex-grp').css('display', ''); }
-        else if (mode === 'keyword') $('#wizard-sandbox-keyword').css('display', '');
+        else if (mode === 'keyword') $('#wizard-sandbox-keyword-wrap').css('display', '');
         else if (mode === 'time') {
             $('#wizard-sandbox-time-wrap').css('display', 'flex');
             // Default range = yesterday → today (date inputs are day-granular).
@@ -10701,24 +10774,13 @@ function registerNodeFormListeners() {
         if (e.type === 'keydown') e.preventDefault();
         const floor = parseInt($(this).val());
         if (isNaN(floor)) { toastr.warning('请输入要跳转的楼层编号！'); return; }
-        const entries = getFilteredSandboxEntries();
-        const pos = entries.findIndex(en => en.floor === floor);
-        if (pos < 0) {
+        if (!jumpToSandboxFloor(floor)) {
             toastr.warning(`楼层 #${floor} 不在当前筛选结果中。`);
             return;
         }
-        sandboxPage = Math.floor(pos / SANDBOX_PAGE_SIZE);
-        renderSandboxChat();
-        // Scroll the target floor's textarea into view, focus it, and flash the row.
-        const target = $(`.context-msg-textarea[data-index="${floor}"]`);
-        if (target.length > 0) {
-            target[0].scrollIntoView({ block: 'center' });
-            target.focus();
-            const row = target.closest('.wizard-context-msg-item');
-            const orig = row.css('box-shadow');
-            row.css('box-shadow', '0 0 0 2px #60a5fa');
-            setTimeout(() => row.css('box-shadow', orig), 1200);
-        }
+        // Unlike the keyword-clear path, an explicit jump also focuses the body so the
+        // user can start editing the floor they asked for straight away.
+        $(`.context-msg-textarea[data-index="${floor}"]`).focus();
     });
 
     // Jump directly to page number X (1-based, matches the "第 X / N 页" label).
