@@ -153,6 +153,7 @@ let config = {
     sandboxPageSize: 100,
     sandboxRegex: "",
     sandboxKeyword: "",
+    sandboxKeywordMode: "phrase", // 关键词空格分词时的匹配方式：phrase=整段 | and=都含 | or=任一
     sandboxMatchMode: "keyword",
     shijiRegex: "",            // legacy single-regex; migrated into shijiRules on load
     shijiMode: 'uncovered',    // 时记 floor selection: 'fixed' | 'uncovered'
@@ -5016,6 +5017,7 @@ async function loadConfig() {
         $('#wizard-sandbox-page-size').val(config.sandboxPageSize !== undefined ? config.sandboxPageSize : 100);
         $('#wizard-sandbox-regex').val(config.sandboxRegex || '');
         $('#wizard-sandbox-keyword').val(config.sandboxKeyword || '');
+        $('#wizard-sandbox-keyword-logic').val(liveKeywordMode());
         $('#wizard-sandbox-match-mode').val(config.sandboxMatchMode || 'keyword');
         if (!$('#wizard-sandbox-match-mode').val()) $('#wizard-sandbox-match-mode').val('keyword');
         $('#wizard-sandbox-match-mode').trigger('change');
@@ -5276,6 +5278,7 @@ async function saveConfig(silent = false) {
     config.sandboxPageSize = Math.max(10, Math.min(1000, parseInt($('#wizard-sandbox-page-size').val()) || 100));
     config.sandboxRegex = $('#wizard-sandbox-regex').val() || "";
     config.sandboxKeyword = $('#wizard-sandbox-keyword').val() || "";
+    config.sandboxKeywordMode = $('#wizard-sandbox-keyword-logic').val() || "phrase";
     config.sandboxMatchMode = $('#wizard-sandbox-match-mode').val() || 'keyword';
     // config.shijiRules / config.shijiMode are mutated live by the rule handlers
     // (same pattern as sandboxFilters), so no DOM read is needed here. The legacy
@@ -8463,18 +8466,60 @@ function msgModel(msg) {
     return (msg.extra && (msg.extra.model || msg.extra.api)) || msg.model || "";
 }
 
+// 关键词的三种匹配方式。只有用空格分词时三者才有区别（单个词下完全等价）。
+// 以查询「A B」为例：
+//   phrase — 整段匹配：只命中连在一起的「A B」（默认）
+//   and    — 分开匹配：楼层同时含 A 和 B 即可，位置不必相连
+//   or     — 任一匹配：楼层含 A 或 B 就命中
+const KEYWORD_MODES = {
+    phrase: '整段匹配',
+    and: '分开匹配 (且)',
+    or: '任一匹配 (或)',
+};
+
+// The live keyword box's mode, falling back to the phrase default for an
+// unrecognised or missing config value.
+function liveKeywordMode() {
+    return KEYWORD_MODES[config.sandboxKeywordMode] ? config.sandboxKeywordMode : 'phrase';
+}
+
+// A keyword TAG's mode. Tags saved before this setting existed carry no kwMode and
+// were AND-matched when they were built, so they keep meaning what they meant then
+// rather than silently re-interpreting as the new phrase default.
+function keywordModeOf(tag) {
+    return KEYWORD_MODES[tag && tag.kwMode] ? tag.kwMode : 'and';
+}
+
+// Whitespace-separated terms of a keyword query.
+function keywordTerms(keyword) {
+    return String(keyword || '').trim().split(/\s+/).filter(Boolean);
+}
+
+// The keyword currently driving filtering/highlighting: the live box wins, otherwise
+// the first keyword tag. Returns { kw, mode } so callers never pair a keyword with
+// the wrong mode.
+function activeKeywordQuery() {
+    const live = (config.sandboxKeyword || '').trim();
+    if (live) return { kw: live, mode: liveKeywordMode() };
+    const tag = sandboxFilters.find(f => f.type === 'keyword' && f.value);
+    return tag ? { kw: tag.value, mode: keywordModeOf(tag) } : { kw: '', mode: 'phrase' };
+}
+
 // HTML-escape `text`, then wrap every case-insensitive occurrence of `kw` in an
 // orange <mark>. The FIRST match additionally carries class `wizard-kw-hit` so the
 // caller can scroll it into the center of view. Returns { html, hits }.
-function highlightKeyword(text, kw) {
+// `mode` mirrors the matcher: phrase highlights the whole query (spaces included) as
+// one unit, and/or highlight each term separately.
+function highlightKeyword(text, kw, mode) {
     const safe = escapeHtml(text);
     if (!kw) return { html: safe, hits: 0 };
-    // Whitespace-separated terms are AND-matched; highlight every matched term.
-    const terms = String(kw).trim().split(/\s+/).filter(Boolean)
-        .map(term => escapeHtml(term).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-    if (!terms.length) return { html: safe, hits: 0 };
+    const esc = (s) => escapeHtml(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const parts = mode === 'phrase'
+        ? [esc(String(kw).trim())].filter(Boolean)
+        : keywordTerms(kw).map(esc);
+    if (!parts.length) return { html: safe, hits: 0 };
     let hits = 0;
-    const html = safe.replace(new RegExp(terms.join('|'), 'gi'), (m) => {
+    const html = safe.replace(new RegExp(parts.join('|'), 'gi'), (m) => {
         hits++;
         const cls = hits === 1 ? 'wizard-kw-hit' : '';
         return `<mark class="${cls}" style="background:#f97316; color:#1a1a1a; border-radius:2px; padding:0 1px;">${m}</mark>`;
@@ -8482,11 +8527,17 @@ function highlightKeyword(text, kw) {
     return { html, hits };
 }
 
-// Space-separated keywords are an AND query: every term must occur in this one floor.
-function keywordMatches(text, keyword) {
+// Does this floor's text satisfy the keyword query under `mode`? See KEYWORD_MODES.
+function keywordMatches(text, keyword, mode) {
     const haystack = String(text || '').toLowerCase();
-    return String(keyword || '').trim().split(/\s+/).filter(Boolean)
-        .every(term => haystack.includes(term.toLowerCase()));
+    const query = String(keyword || '').trim().toLowerCase();
+    if (!query) return true;
+    if (mode === 'phrase') return haystack.includes(query);
+    const terms = keywordTerms(query);
+    if (!terms.length) return true;
+    return mode === 'or'
+        ? terms.some(term => haystack.includes(term))
+        : terms.every(term => haystack.includes(term));
 }
 
 // Does a regex tag's optional role/position window apply to this floor?
@@ -8664,9 +8715,9 @@ function messagePassesFilters(msg, floor, coverageMap) {
     if (passthroughSide) {
         const liveKwPT = (config.sandboxKeyword || '').trim();
         const body = msgBody(msg);
-        if (liveKwPT && !keywordMatches(body, liveKwPT)) return false;
+        if (liveKwPT && !keywordMatches(body, liveKwPT, liveKeywordMode())) return false;
         for (const f of sandboxFilters) {
-            if (f.type === 'keyword' && f.value && !keywordMatches(body, f.value)) return false;
+            if (f.type === 'keyword' && f.value && !keywordMatches(body, f.value, keywordModeOf(f))) return false;
         }
         return true;
     }
@@ -8675,14 +8726,14 @@ function messagePassesFilters(msg, floor, coverageMap) {
     // Live keyword (typed in the keyword box, applies without a tag). It is treated
     // as right-most, so every regex tag narrows its search scope (left = stronger).
     const liveKw = (config.sandboxKeyword || '').trim();
-    if (liveKw && !keywordMatches(keywordScopeText(msg, -1, floor), liveKw)) return false;
+    if (liveKw && !keywordMatches(keywordScopeText(msg, -1, floor), liveKw, liveKeywordMode())) return false;
     for (let fi = 0; fi < sandboxFilters.length; fi++) {
         const f = sandboxFilters[fi];
         if (f.type === 'keyword' && f.value) {
             // ctrl+F style: case-insensitive substring search, but ONLY within the
             // text left by regex tags positioned to this keyword's LEFT (higher
             // weight). With no regex to its left, it searches the full body.
-            if (!keywordMatches(keywordScopeText(msg, fi, floor), f.value)) return false;
+            if (!keywordMatches(keywordScopeText(msg, fi, floor), f.value, keywordModeOf(f))) return false;
         } else if (f.type === 'regex' && f.value) {
             // A KEEP regex tag also acts as a filter (AND): the message must contain a
             // match for EVERY active keep tag. Multiple regex tags are allowed.
@@ -8768,7 +8819,12 @@ function filterTagLabel(f) {
         else if (min != null) posStr = ` · 第${min}新及更早`;
         return `正则: ${f.value}${modeStr}${roleStr}${posStr}`;
     }
-    if (f.type === 'keyword') return `关键词: ${f.value}`;
+    // Only label the mode when the query has several terms — with one term all three
+    // modes behave identically and the suffix would be noise on every tag.
+    if (f.type === 'keyword') {
+        const suffix = keywordTerms(f.value).length > 1 ? ` [${KEYWORD_MODES[keywordModeOf(f)]}]` : '';
+        return `关键词: ${f.value}${suffix}`;
+    }
     if (f.type === 'model') return `模型: ${f.value}`;
     if (f.type === 'role') {
         const keep = typeof f.value === 'string' ? f.value : f.value.keep;
@@ -8934,7 +8990,7 @@ function renderSandboxChat() {
         // it lives in a standalone orange preview box. Either way the first <mark> is
         // scrolled to the floor's center after render.
         const activeKwTag = sandboxFilters.find(f => f.type === 'keyword' && f.value);
-        const activeKw = (config.sandboxKeyword || '').trim() || (activeKwTag?.value || '');
+        const { kw: activeKw, mode: activeKwMode } = activeKeywordQuery();
         const kwIdx = activeKwTag ? sandboxFilters.indexOf(activeKwTag) : -1;
         const kwScope = activeKw ? keywordScopeText(msg, kwIdx, floorId) : '';
 
@@ -8980,11 +9036,11 @@ function renderSandboxChat() {
             // exactly where it landed within the regex match (e.g. inside the recap).
             const shownText = matched ? extracted : '';
             const { html: extractedHtml } = activeKw
-                ? highlightKeyword(shownText, activeKw)
+                ? highlightKeyword(shownText, activeKw, activeKwMode)
                 : { html: escapeHtml(shownText) };
             // When the keyword is highlighted in this box, mark the box with an orange
             // left bar; otherwise keep the green/grey regex-match indicator.
-            const kwInBox = activeKw && keywordMatches(shownText, activeKw);
+            const kwInBox = activeKw && keywordMatches(shownText, activeKw, activeKwMode);
             const barColor = kwInBox ? '#f97316' : (matched ? '#34d399' : 'rgba(255,255,255,0.15)');
             // Label: keep-only → 匹配 / 无匹配；remove-only → 处理后 / 无匹配（未改动）；mixed → 处理后.
             let label;
@@ -9001,7 +9057,7 @@ function renderSandboxChat() {
         // the first hit be scrolled to center just like the regex case.
         let kwPreview = '';
         if (activeKw && !hasRegex) {
-            const { html: hl, hits } = highlightKeyword(kwScope || rawContent, activeKw);
+            const { html: hl, hits } = highlightKeyword(kwScope || rawContent, activeKw, activeKwMode);
             if (hits > 0) {
                 kwPreview = `<div class="wizard-kw-preview" style="font-size: 0.82em; color: #d1d5db; background: rgba(0,0,0,0.25); border-left: 3px solid #f97316; padding: 4px 8px; border-radius: 3px; white-space: pre-wrap; word-break: break-word; max-height: 220px; overflow-y: auto;">${hl}</div>`;
             }
@@ -10370,6 +10426,16 @@ function registerNodeFormListeners() {
         saveConfig(true);
     });
 
+    // Space-separated terms: phrase / AND / OR. Re-filters immediately so the effect
+    // of switching is visible without retyping the keyword.
+    $(document).off('change', '#wizard-sandbox-keyword-logic').on('change', '#wizard-sandbox-keyword-logic', function () {
+        config.sandboxKeywordMode = $(this).val() || 'phrase';
+        sandboxPage = 0;
+        renderSandboxChat();
+        centerMiddleKeywordHit();
+        saveConfig(true);
+    });
+
     // Red X inside the keyword box: clear the search in one click. The floor at the
     // centre of the view is captured first and re-centred afterwards — dropping the
     // filter makes the list far longer, so without an anchor the same scroll offset
@@ -10413,7 +10479,7 @@ function registerNodeFormListeners() {
         sandboxMatchMode = mode;
         $('.wizard-sandbox-mode-input').hide();
         if (mode === 'regex') { $('#wizard-sandbox-regex').css('display', ''); $('.wizard-sandbox-regex-grp').css('display', ''); }
-        else if (mode === 'keyword') $('#wizard-sandbox-keyword-wrap').css('display', '');
+        else if (mode === 'keyword') $('#wizard-sandbox-keyword-wrap, #wizard-sandbox-keyword-logic').css('display', '');
         else if (mode === 'time') {
             $('#wizard-sandbox-time-wrap').css('display', 'flex');
             // Default range = yesterday → today (date inputs are day-granular).
@@ -10498,7 +10564,10 @@ function registerNodeFormListeners() {
             $('#wizard-sandbox-regex-posmax').val((f.posMax == null || f.posMax === '') ? '' : f.posMax);
             $('#wizard-sandbox-regex-mode').val(f.mode === 'remove' ? 'remove' : 'keep');
         }
-        else if (f.type === 'keyword') $('#wizard-sandbox-keyword').val(f.value || '');
+        else if (f.type === 'keyword') {
+            $('#wizard-sandbox-keyword').val(f.value || '');
+            $('#wizard-sandbox-keyword-logic').val(keywordModeOf(f));
+        }
         else if (f.type === 'model') $('#wizard-sandbox-model-sel').val(f.value || '');
         else if (f.type === 'size') $('#wizard-sandbox-size-dir').val(f.value || 'desc');
         else if (f.type === 'role') {
@@ -10563,7 +10632,7 @@ function registerNodeFormListeners() {
         } else if (mode === 'keyword') {
             const v = $('#wizard-sandbox-keyword').val().trim();
             if (!v) { toastr.warning('请输入关键词。'); return; }
-            tag = { type: 'keyword', value: v };
+            tag = { type: 'keyword', value: v, kwMode: liveKeywordMode() };
         } else if (mode === 'time') {
             const fromStr = $('#wizard-sandbox-time-from').val();
             const toStr = $('#wizard-sandbox-time-to').val();
@@ -10651,13 +10720,18 @@ function registerNodeFormListeners() {
             sandboxFilters = [];
             config.sandboxRegex = '';
             config.sandboxKeyword = '';
+            config.sandboxKeywordMode = 'phrase';
         } else {
             sandboxFilters = JSON.parse(JSON.stringify(t.filters || []));
             config.sandboxRegex = t.regex || '';
             config.sandboxKeyword = t.keyword || '';
+            // Templates saved before the mode selector existed carry no keywordMode and
+            // meant AND at the time, so they keep that rather than becoming phrases.
+            config.sandboxKeywordMode = KEYWORD_MODES[t.keywordMode] ? t.keywordMode : 'and';
         }
         $('#wizard-sandbox-regex').val(config.sandboxRegex);
         $('#wizard-sandbox-keyword').val(config.sandboxKeyword);
+        $('#wizard-sandbox-keyword-logic').val(liveKeywordMode());
         renderSandboxFilterTags();
         sandboxPage = 0;
         renderSandboxChat();
@@ -10682,6 +10756,7 @@ function registerNodeFormListeners() {
             filters: JSON.parse(JSON.stringify(sandboxFilters)),
             regex: config.sandboxRegex || '',
             keyword: config.sandboxKeyword || '',
+            keywordMode: liveKeywordMode(),
         };
         const existing = config.matchTemplates.findIndex(t => t.name === name);
         if (existing >= 0) config.matchTemplates[existing] = snapshot;

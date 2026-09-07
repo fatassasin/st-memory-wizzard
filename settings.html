@@ -1249,7 +1249,7 @@
                     <div style="display: flex; align-items: center; gap: 4px; flex-wrap: wrap;">
                         <i class="fa-solid fa-filter" style="color: var(--wizard-primary);"></i>
                         匹配方式
-                        <span class="wizard-tooltip-icon wizard-tooltip-down" data-tooltip="可叠加多种匹配方式（类似 pixiv 标签）：① 关键词——浏览器 Ctrl+F 式包含匹配；用空格分隔多个词时，同一楼层必须同时包含每个词，词之间无需相连；② 正则——提取/筛选匹配部分（带捕获组取第1组），同时决定 {{history}} 注入的正文；③ 时间段——按消息时间过滤；④ 按字数——对结果排序。每加一个都会在下方生成可 X 掉的标签。">?</span>
+                        <span class="wizard-tooltip-icon wizard-tooltip-down" data-tooltip="可叠加多种匹配方式（类似 pixiv 标签）：① 关键词——浏览器 Ctrl+F 式包含匹配；用空格分隔多个词时，右侧下拉框决定怎么算命中（整段／都要有／有其一）；② 正则——提取/筛选匹配部分（带捕获组取第1组），同时决定 {{history}} 注入的正文；③ 时间段——按消息时间过滤；④ 按字数——对结果排序。每加一个都会在下方生成可 X 掉的标签。">?</span>
                         <select class="wizard-select" id="wizard-sandbox-match-mode"
                             style="padding: 3px 6px; font-size: 0.95em; background: rgba(0,0,0,0.25);">
                             <option value="keyword">关键词 (Ctrl+F)</option>
@@ -1259,6 +1259,13 @@
                             <option value="model">AI 模型</option>
                             <option value="role">角色 (User/AI)</option>
                             <option value="record">按记筛选 (史记/周记/日记)</option>
+                        </select>
+                        <select class="wizard-select wizard-sandbox-mode-input" id="wizard-sandbox-keyword-logic"
+                            title="关键词用空格分词时怎么算命中。单个词时三者等价。"
+                            style="display: none; padding: 3px 6px; font-size: 0.95em; background: rgba(0,0,0,0.25);">
+                            <option value="phrase">整段匹配：连着出现才算</option>
+                            <option value="and">分开匹配：每个词都要有</option>
+                            <option value="or">任一匹配：有其中一个就行</option>
                         </select>
                     </div>
                     <!-- Dynamic value inputs per mode -->
@@ -1282,7 +1289,7 @@
                         <input type="text" class="wizard-input wizard-sandbox-mode-input" id="wizard-sandbox-regex" placeholder="如 <recap>([\s\S]*?)</recap>"
                             style="flex: 1; min-width: 160px; padding: 3px 6px; font-size: 0.95em; background: rgba(0,0,0,0.25); font-family: monospace;">
                         <span class="wizard-sandbox-mode-input wizard-kw-search-wrap" id="wizard-sandbox-keyword-wrap" style="display: none;">
-                            <input type="text" class="wizard-input" id="wizard-sandbox-keyword" placeholder="关键词；空格=同时包含…"
+                            <input type="text" class="wizard-input" id="wizard-sandbox-keyword" placeholder="关键词；空格分词，右上角选匹配方式…"
                                 style="padding: 3px 6px; font-size: 0.95em; background: rgba(0,0,0,0.25);">
                             <button id="wizard-sandbox-keyword-clear" title="清空关键词"><i class="fa-solid fa-xmark"></i></button>
                         </span>
