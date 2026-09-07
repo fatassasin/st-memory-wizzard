@@ -1281,8 +1281,11 @@
                         </select>
                         <input type="text" class="wizard-input wizard-sandbox-mode-input" id="wizard-sandbox-regex" placeholder="如 <recap>([\s\S]*?)</recap>"
                             style="flex: 1; min-width: 160px; padding: 3px 6px; font-size: 0.95em; background: rgba(0,0,0,0.25); font-family: monospace;">
-                        <input type="text" class="wizard-input wizard-sandbox-mode-input" id="wizard-sandbox-keyword" placeholder="关键词；空格=同时包含…"
-                            style="display: none; flex: 1; min-width: 160px; padding: 3px 6px; font-size: 0.95em; background: rgba(0,0,0,0.25);">
+                        <span class="wizard-sandbox-mode-input wizard-kw-search-wrap" id="wizard-sandbox-keyword-wrap" style="display: none;">
+                            <input type="text" class="wizard-input" id="wizard-sandbox-keyword" placeholder="关键词；空格=同时包含…"
+                                style="padding: 3px 6px; font-size: 0.95em; background: rgba(0,0,0,0.25);">
+                            <button id="wizard-sandbox-keyword-clear" title="清空关键词"><i class="fa-solid fa-xmark"></i></button>
+                        </span>
                         <span class="wizard-sandbox-mode-input" id="wizard-sandbox-time-wrap" style="display: none; align-items: center; gap: 4px;">
                             从 <input type="date" class="wizard-input" id="wizard-sandbox-time-from" style="padding: 2px 6px; font-size: 0.9em; background: rgba(0,0,0,0.25);">
                             到 <input type="date" class="wizard-input" id="wizard-sandbox-time-to" style="padding: 2px 6px; font-size: 0.9em; background: rgba(0,0,0,0.25);">
