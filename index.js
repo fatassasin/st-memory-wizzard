@@ -9074,6 +9074,7 @@ function renderSandboxChat() {
                         <i class="fa-solid fa-arrow-up wizard-set-fusion-start-btn" data-floor="${floorId}" style="cursor: pointer; color: #34d399; font-size: 0.9em;" title="设为融合起始楼层"></i>
                         <i class="fa-solid fa-arrow-down wizard-set-fusion-end-btn" data-floor="${floorId}" style="cursor: pointer; color: #f97316; font-size: 0.9em;" title="设为融合结束楼层"></i>
                         <i class="fa-solid fa-expand wizard-msg-fullscreen-btn" data-index="${index}" style="cursor: pointer; color: #60a5fa; font-size: 0.9em;" title="全屏编辑这条消息"></i>
+                        <i class="fa-solid fa-location-crosshairs wizard-goto-chat-btn" data-floor="${floorId}" style="cursor: pointer; color: #a78bfa; font-size: 0.9em;" title="在聊天正文中跳到这一层（会关闭本窗口）"></i>
                     </div>
                 </div>
                 <textarea class="context-msg-textarea wizard-input" data-index="${index}" style="width: 100%; min-height: 45px; font-size: 0.9em; padding: 6px 8px; resize: vertical; line-height: 1.4; font-family: inherit; margin: 0; box-sizing: border-box; background: rgba(0,0,0,0.15) !important; border: 1px solid rgba(255,255,255,0.06) !important;">${escapeHtml(rawContent)}</textarea>
@@ -15088,6 +15089,41 @@ function registerNodeFormListeners() {
         $('#wizard-fusion-end').val(floor).trigger('change');
         config.fusionEnd = String(floor);
         saveConfig(true);
+    });
+
+    // 楼层卡片上的定位图标：跳到 SillyTavern 正文的同一层。
+    // 走核心的 /chat-jump 而不是自己滚动：正文默认只渲染最近
+    // power_user.chat_truncation 层（默认 100），更早的楼层压根不在 DOM 里，
+    // 自己怎么滚都找不到。/chat-jump 会先按缺口补加载再滚过去并高亮。
+    $(document).off('click', '.wizard-goto-chat-btn').on('click', '.wizard-goto-chat-btn', async function () {
+        const floor = parseInt($(this).data('floor'));
+        if (isNaN(floor)) return;
+
+        const ctx = window.SillyTavern?.getContext?.();
+        // /chat-jump 是较新的核心命令；探测注册表而不是直接调用，
+        // 这样旧版本上会给出明确提示，而不是关掉窗口后一片寂静。
+        const hasJump = !!ctx?.SlashCommandParser?.commands?.['chat-jump'];
+        if (!ctx || typeof ctx.executeSlashCommandsWithOptions !== 'function' || !hasJump) {
+            toastr.error('当前 SillyTavern 版本不支持 /chat-jump，无法跳转到正文楼层。');
+            return;
+        }
+        if (!Array.isArray(ctx.chat) || floor >= ctx.chat.length) {
+            toastr.warning(`楼层 #${floor} 已不在当前聊天中，沙盒快照可能已过期。`);
+            return;
+        }
+
+        // 向导弹窗是全屏遮罩，不关掉就只是在它背后滚动，用户什么都看不到。
+        // 关闭只是隐藏：沙盒的筛选、分页和尚未应用的编辑都留在内存里，重开即恢复。
+        toggleModal(false);
+        try {
+            await ctx.executeSlashCommandsWithOptions(`/chat-jump ${floor}`, {
+                handleExecutionErrors: true,
+                source: 'st-memory-wizzard-goto',
+            });
+        } catch (e) {
+            console.error(`${LOG_PREFIX} /chat-jump failed`, e);
+            toastr.error(`跳转到楼层 #${floor} 失败：${e.message}`);
+        }
     });
 
     // Per-message fullscreen editor events (each sandbox reply opens its own).
