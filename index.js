@@ -156,7 +156,8 @@ let config = {
     sandboxKeywordMode: "phrase", // 关键词空格分词时的匹配方式：phrase=整段 | and=都含 | or=任一
     sandboxMatchMode: "keyword",
     shijiRegex: "",            // legacy single-regex; migrated into shijiRules on load
-    shijiMode: 'uncovered',    // 时记 floor selection: 'fixed' | 'uncovered'
+    shijiMode: 'uncovered',    // 时记 floor selection: 'fixed' | 'uncovered' | 'event'
+    shijiEventRegex: "<recap>([\\s\\S]*?)</recap>", // 'event' 模式：识别 AI 楼里的事件 recap（有捕获组取组 1）
     shijiKeepFloors: 0,        // 始终保持X楼：始终至少保留最近 X 楼正文（即使已被日记/周记/史记覆盖），防刚总结完无正文参照导致角色偏移。0=关闭
     shijiShowFloor: false,      // 时记注入是否附带楼层编号 [楼层 N]
     shijiShowRealDate: false,   // legacy: 已被 shijiShowDateAi/User 取代，迁移时读取
@@ -164,6 +165,7 @@ let config = {
     shijiShowDateUser: false,   // User 楼附带现实时间
     shijiShowModel: false,      // 时记每楼附带模型名（msgModel 读取）
     shijiRules: [],            // [{ regex, posMin|null, posMax|null, role:'ai'|'user'|'both' }]
+    shijiRuleSets: null,       // 按发送模式分组的时记规则：{ normal, event }。当前模式那组即 shijiRules，另一组存在这里
     summaryDefaultShowRealTime: false, // 新建日记/周记/史记默认开启蓝色小时钟（现实时间注入）
     fakeChatHistory: false,         // 伪造成聊天历史：用 setExtensionPrompt(IN_CHAT) 把记忆插进 user 消息前，并计入 Itemization
     fakeChatHistoryIncludeSummaries: false, // 伪造历史时，将史记/周记/日记合成一条 assistant 消息
@@ -3873,17 +3875,80 @@ function compileMemoryTreeMacroValue() {
     return blocks.join('\n\n');
 }
 
+// 'event' 模式的 recap 识别正则。空 / 非法 → null，调用方退回 'uncovered' 行为。
+// 时记规则按发送模式分两组：'normal'（固定/未归类）与 'event'（按事件）。
+// config.shijiRules 始终是当前模式那组（所有规则编辑器直接改它），
+// 另一组存放在 config.shijiRuleSets 里，切换模式时互换。
+function shijiRuleGroup(mode) {
+    return mode === 'event' ? 'event' : 'normal';
+}
+
+// 首次进入按事件模式时，从普通组派生一套规则：去掉 AI 侧"只保留 recap"的规则
+// （按事件模式已自行提取 recap，留着会把保持楼层里的 recap 楼也削成只剩 recap），其余照抄。
+function deriveEventShijiRules(rules) {
+    return (Array.isArray(rules) ? rules : [])
+        .filter(r => !(r && r.mode !== 'remove' && r.role !== 'user' && /recap/i.test(r.regex || '')))
+        .map(r => ({ ...r }));
+}
+
+// 从 fromMode 切到 toMode 时换入对应的规则组；同组内切换（固定↔未归类）不动。
+function swapShijiRuleSet(fromMode, toMode) {
+    const from = shijiRuleGroup(fromMode), to = shijiRuleGroup(toMode);
+    if (from === to) return false;
+    if (!config.shijiRuleSets || typeof config.shijiRuleSets !== 'object') config.shijiRuleSets = {};
+    const current = Array.isArray(config.shijiRules) ? config.shijiRules : [];
+    config.shijiRuleSets[from] = current.map(r => ({ ...r }));
+    const stored = config.shijiRuleSets[to];
+    config.shijiRules = Array.isArray(stored)
+        ? stored.map(r => ({ ...r }))
+        : (to === 'event' ? deriveEventShijiRules(current) : current.map(r => ({ ...r })));
+    delete config.shijiRuleSets[to];
+    return true;
+}
+
+function shijiEventRegex() {
+    const pattern = String(config.shijiEventRegex || '').trim();
+    if (!pattern) return null;
+    try { return new RegExp(pattern, 'g'); } catch (e) { return null; }
+}
+
+// 取出一楼里所有事件 recap（有捕获组取组 1）。与 applyRegexFilter 不同：
+// 没匹配时返回 ''，不原样放行——按事件模式下「没写 recap」本身就是有意义的信号。
+function extractShijiEventRecap(text, re) {
+    if (!re || !text) return '';
+    re.lastIndex = 0;
+    const parts = [];
+    let m;
+    while ((m = re.exec(text)) !== null) {
+        const part = (m[1] !== undefined ? m[1] : m[0]).trim();
+        if (part) parts.push(part);
+        if (m.index === re.lastIndex) re.lastIndex++;
+    }
+    return parts.join('\n');
+}
+
+function shijiFloorBody(m) {
+    if (!m) return '';
+    return (m.content !== undefined ? m.content : m.mes) || '';
+}
+
 // Determine which floors the 时记 (recent-messages) block should cover.
-// Two modes (config.shijiMode), both capped to N_SHIJI:
+// Three modes (config.shijiMode):
 //   'fixed'     — the newest N floors, regardless of whether they're already
 //                 covered by a 日记/周记/史记. Simple "last N messages".
 //   'uncovered' — (default) walk backwards from newest, collect the contiguous
 //                 run of floors NOT yet covered by any record; stop at the first
 //                 already-covered floor. Fills exactly the gap since the last
 //                 archive. N_SHIJI is an UPPER BOUND on that run.
-// Returns an array of 0-based floor ids, ascending.
-function computeShijiFloors(chatList) {
-    if (!Array.isArray(chatList) || chatList.length === 0) return [];
+//   'event'     — 按事件：AI 只在场景/地点/话题切换时写一段 recap。在整段未归档
+//                 楼层里（不设上限），带 recap 的 AI 楼只注入 recap；最后一个 recap
+//                 楼之后的楼层（进行中、尚未 recap 的事件）注入全文，上限 N_SHIJI；
+//                 更早的无 recap 楼层已被后面的 recap 概括，不再注入。
+// Returns { floors, recapOnly }: floors = 0-based floor ids ascending;
+// recapOnly = 只注入 recap 的楼层集合（仅 'event' 模式非空）。
+function computeShijiPlan(chatList) {
+    const recapOnly = new Set();
+    if (!Array.isArray(chatList) || chatList.length === 0) return { floors: [], recapOnly };
     const cap = Math.max(1, parseInt(config.N_SHIJI) || 20);
     const L = chatList.length;
 
@@ -3904,7 +3969,7 @@ function computeShijiFloors(chatList) {
         const start = Math.max(0, L - cap);
         const floors = [];
         for (let f = start; f < L; f++) floors.push(f);
-        return withKeepFloor(floors); // already ascending
+        return { floors: withKeepFloor(floors), recapOnly }; // already ascending
     }
 
     // 'uncovered' (default). Coverage is matched by SEND-TIME, not original floor
@@ -3914,25 +3979,53 @@ function computeShijiFloors(chatList) {
     // send-time coverage set only marks a current floor covered when its send_date
     // actually falls inside some record's stored time range.
     const coveredNow = buildCurrentCoverageSet(chatList);
+
+    // 'event'：正则为空或非法时 eventRe=null，整体退回下面的 'uncovered' 行为。
+    const eventRe = config.shijiMode === 'event' ? shijiEventRegex() : null;
+    if (eventRe) {
+        // 整段未归档楼层都参与，不受 N_SHIJI 限制——recap 很短，全部保留。
+        let regionStart = L;
+        while (regionStart > 0 && !coveredNow.has(regionStart - 1)) regionStart--;
+        // 只认 AI 楼的 recap：用户楼里偶尔引用到的 <recap> 不算事件边界。
+        const recapFloors = [];
+        for (let f = regionStart; f < L; f++) {
+            const m = chatList[f];
+            if (msgRoleSide(m) !== 'ai') continue;
+            if (extractShijiEventRecap(shijiFloorBody(m), eventRe)) recapFloors.push(f);
+        }
+        // 最后一个 recap 楼之后 = 进行中的事件，注入全文；一个 recap 都没有时
+        // 等同 'uncovered'。N_SHIJI 只限制这段全文的楼数。
+        const lastRecap = recapFloors.length ? recapFloors[recapFloors.length - 1] : regionStart - 1;
+        const full = new Set();
+        for (let f = Math.max(lastRecap + 1, L - cap); f < L; f++) full.add(f);
+        // 始终保持X楼：刚写完 recap 的那几楼也照样给全文，而不是只剩 recap。
+        for (let f = Math.max(0, L - keep); f < L; f++) full.add(f);
+        recapFloors.forEach(f => { if (!full.has(f)) recapOnly.add(f); });
+        const floors = [...recapOnly, ...full].sort((a, b) => a - b);
+        return { floors, recapOnly };
+    }
+
     const floors = [];
     for (let f = L - 1; f >= 0; f--) {
         if (coveredNow.has(f)) break;      // hit archived material — stop
         floors.push(f);
         if (floors.length >= cap) break;   // upper-bound reached
     }
-    return withKeepFloor(floors.reverse()); // ascending order for display/injection
+    return { floors: withKeepFloor(floors.reverse()), recapOnly }; // ascending order for display/injection
 }
 
 // Format one 时记 floor into its injectable text line: `[prefix] [Name]: text`.
 // Shared by compileShiji() (merged block) and injectMemoryAsHistory() (per-floor
 // fake chat-history injection) so the rule-chain + prefix logic stays in one place.
-// pos = L - floorId (newest floor = 1).
-function formatShijiFloor(m, floorId, pos) {
+// pos = L - floorId (newest floor = 1). recapOnly：按事件模式下只注入该楼的 recap，
+// 不走时记规则链（规则是为全文楼写的，套在 recap 上容易误伤）。
+function formatShijiFloor(m, floorId, pos, recapOnly = false) {
     if (!m) return '';
     const role = msgRoleSide(m); // system grouped with AI side
-    const contentKey = m.content !== undefined ? 'content' : 'mes';
     const name = msgName(m);
-    const { text } = applyShijiRules(m[contentKey] || "", role, pos);
+    const text = recapOnly
+        ? extractShijiEventRecap(shijiFloorBody(m), shijiEventRegex())
+        : applyShijiRules(shijiFloorBody(m), role, pos).text;
     const showDate = m.is_user ? config.shijiShowDateUser : config.shijiShowDateAi;
     // 模型名只对 AI 楼有意义（user 楼没有 model 字段）。
     const modelLabel = (config.shijiShowModel && !m.is_user) ? msgModel(m) : '';
@@ -3944,7 +4037,7 @@ function formatShijiFloor(m, floorId, pos) {
     return `${prefix ? prefix + ' ' : ''}[${name}]: ${text}`;
 }
 
-// Compile the 时记 block: the selected floors (see computeShijiFloors), each
+// Compile the 时记 block: the selected floors (see computeShijiPlan), each
 // transformed by the multi-rule regex chain (applyShijiRules). Counted by
 // individual message (楼层 / mesid) — the same unit used by 史记/周记/日记.
 function compileShiji() {
@@ -3954,11 +4047,11 @@ function compileShiji() {
         return "";
     }
     const L = chatList.length;
-    const floors = computeShijiFloors(chatList);
+    const { floors, recapOnly } = computeShijiPlan(chatList);
     return floors.map((floorId) => {
         const m = chatList[floorId];
         if (!m) return '';
-        return formatShijiFloor(m, floorId, L - floorId);
+        return formatShijiFloor(m, floorId, L - floorId, recapOnly.has(floorId));
     }).filter(Boolean).join('\n');
 }
 
@@ -4109,7 +4202,7 @@ function injectMemoryAsHistory(type) {
     //   • swipe：coreChat.pop() 把被 swipe 的那条丢掉再重新生成（见 script.js:4471）；
     //   • continue：保留它作为「正文前缀」（reasoning + body）让模型接着写（见 script.js:4506）。
     // 注意原生 ST 只从 coreChat（用于拼 prompt 的副本）里 pop，ctx.chat 仍保留这条。所以本插件
-    // computeShijiFloors(ctx.chat) 默认会把这条最后一楼也选中并当成「假对话轮次」注入回去——
+    // computeShijiPlan(ctx.chat) 默认会把这条最后一楼也选中并当成「假对话轮次」注入回去——
     // swipe 时就会把原回复正文再喂给模型（无法重新生成新回复）；continue 时则会把同一楼重复注入、
     // 扰乱前缀。因此这两种模式下跳过最后一楼，与原生 ST 的 coreChat 语义对齐。
     // （regenerate 不需要：原生 ST 在 Generate 早期就 chat.length-- 删掉了那条，ctx.chat 已没有它。）
@@ -4119,7 +4212,7 @@ function injectMemoryAsHistory(type) {
 
     // 2) 时记：升序楼层 → 反转为「最新在前」，逐楼一个独立 depth + 独立 key + 真实 role（AI 楼→
     //    assistant、用户楼→user、系统楼→system），还原成连续的交替对话轮次。
-    const floors = computeShijiFloors(chatList);
+    const { floors, recapOnly } = computeShijiPlan(chatList);
     const usableFloors = excludeLastFloor ? floors.filter(f => f !== lastIdx) : floors;
     const ordered = usableFloors.slice().reverse(); // newest floor first → depth 0（倒数第一）
 
@@ -4165,7 +4258,7 @@ function injectMemoryAsHistory(type) {
     ordered.forEach((floorId, idx) => {
         const m = chatList[floorId];
         if (!m) return;
-        let content = formatShijiFloor(m, floorId, L - floorId);
+        let content = formatShijiFloor(m, floorId, L - floorId, recapOnly.has(floorId));
         if (!content || !content.trim()) return;
         // 滚动断点：在选中楼层正文末尾追加纯文本标记，交本地网关转 cache_control。
         if (rollingSet.has(idx)) {
@@ -4215,9 +4308,11 @@ function renderShijiList() {
     }
 
     const L = chatList.length;
-    const floors = computeShijiFloors(chatList);
+    const { floors, recapOnly } = computeShijiPlan(chatList);
     const cap = Math.max(1, parseInt(config.N_SHIJI) || 20);
     const fixedMode = config.shijiMode === 'fixed';
+    // 正则非法/为空时 computeShijiPlan 已退回 uncovered，这里的标签也跟着退回。
+    const eventMode = config.shijiMode === 'event' && !!shijiEventRegex();
 
     if (floors.length === 0) {
         listEl.html('<span style="color: #6b7280;">（最新楼层都已被日记/周记/史记覆盖，时记为空）</span>');
@@ -4246,8 +4341,12 @@ function renderShijiList() {
         else if (m.is_user) { roleLabel = '用户'; headerColor = '#60a5fa'; }
 
         // Rule-chain preview line. extracted = what actually gets injected.
-        const { text: extracted, appliedRuleIndices } = applyShijiRules(text, role, pos);
-        const hit = appliedRuleIndices.length > 0;
+        // 按事件模式的 recap 楼不走规则链，只注入 recap（与 formatShijiFloor 一致）。
+        const isRecapOnly = recapOnly.has(floorId);
+        const { text: extracted, appliedRuleIndices } = isRecapOnly
+            ? { text: extractShijiEventRecap(text, shijiEventRegex()), appliedRuleIndices: [] }
+            : applyShijiRules(text, role, pos);
+        const hit = isRecapOnly || appliedRuleIndices.length > 0;
         const ruleStr = hit ? appliedRuleIndices.map(i => `#${i + 1}`).join(',') : '';
         const injectedText = hit ? extracted : text;
         const showDatePfx = m.is_user ? config.shijiShowDateUser : config.shijiShowDateAi;
@@ -4258,8 +4357,9 @@ function renderShijiList() {
         const itemTokens = estimateTokens(`${injPrefix ? injPrefix + ' ' : ''}[${name}]: ${injectedText}`);
         totalShijiTokens += itemTokens;
 
-        const matchLineHtml = (Array.isArray(config.shijiRules) && config.shijiRules.length)
-            ? `<div style="font-size:0.8em;color:${hit?'#34d399':'#9ca3af'};background:rgba(0,0,0,0.25);border-left:2px solid ${hit?'#34d399':'rgba(255,255,255,0.15)'};padding:4px 8px;border-radius:3px;white-space:pre-wrap;word-break:break-word;"><i class="fa-solid fa-filter"></i> ${hit?`规则 ${ruleStr} 命中 (将注入此内容)`:'无规则命中 (将注入完整正文)'}: ${escapeHtml(hit?extracted:'')}</div>`
+        const hitLabel = isRecapOnly ? '事件 recap (仅注入 recap)' : `规则 ${ruleStr} 命中 (将注入此内容)`;
+        const matchLineHtml = (isRecapOnly || (Array.isArray(config.shijiRules) && config.shijiRules.length))
+            ? `<div style="font-size:0.8em;color:${hit?'#34d399':'#9ca3af'};background:rgba(0,0,0,0.25);border-left:2px solid ${hit?'#34d399':'rgba(255,255,255,0.15)'};padding:4px 8px;border-radius:3px;white-space:pre-wrap;word-break:break-word;"><i class="fa-solid fa-filter"></i> ${hit?hitLabel:'无规则命中 (将注入完整正文)'}: ${escapeHtml(hit?extracted:'')}</div>`
             : '';
 
         const item = $(`
@@ -4293,6 +4393,8 @@ function renderShijiList() {
     // Update count label with total token tally.
     if (fixedMode) {
         countEl.text(`固定取最新 ${floors.length} 条 / 上限 ${cap} · 共 ${L} 条 · 合计 ${totalShijiTokens.toLocaleString()} tokens`);
+    } else if (eventMode) {
+        countEl.text(`按事件：recap ${recapOnly.size} 条 + 全文 ${floors.length - recapOnly.size} 楼 / 全文上限 ${cap} · 共 ${L} 条 · 合计 ${totalShijiTokens.toLocaleString()} tokens`);
     } else {
         countEl.text(`未归类${capped ? ' 取最新' : ''} ${floors.length} 条 / 上限 ${cap} · 共 ${L} 条 · 合计 ${totalShijiTokens.toLocaleString()} tokens`);
     }
@@ -4884,6 +4986,13 @@ async function loadConfig() {
                 if (serverConfig.mtIncludeRoutedBody === undefined && config.treeInjectionMode === 'pin_only') {
                     config.mtIncludeRoutedBody = false;
                 }
+                // 时记规则分组迁移：存档里还没有 shijiRuleSets（分组前保存的配置）时，丢弃内存里上一次
+                // loadConfig 留下的分组，再按存档重新迁移——loadConfig 会被调用多次，必须以存档为准。
+                // 已处于按事件模式的，现有规则归为普通组，按事件组从它派生。
+                if (serverConfig.shijiRuleSets === undefined) {
+                    config.shijiRuleSets = null;
+                    if (config.shijiMode === 'event') swapShijiRuleSet('uncovered', 'event');
+                }
             }
         } catch (e) {
             console.error(`${LOG_PREFIX} Failed to fetch config from server`, e);
@@ -5035,6 +5144,8 @@ async function loadConfig() {
         }
         if (!config.shijiMode) config.shijiMode = 'uncovered';
         $('#wizard-shiji-mode').val(config.shijiMode);
+        $('#wizard-shiji-event-regex').val(config.shijiEventRegex || '');
+        $('#wizard-shiji-event-row').css('display', config.shijiMode === 'event' ? 'flex' : 'none');
         $('#wizard-shiji-keep-floors').val(parseInt(config.shijiKeepFloors) || 0);
         $('#wizard-shiji-show-floor').prop('checked', !!config.shijiShowFloor);
         // Migrate legacy shijiShowRealDate → shijiShowDateAi + shijiShowDateUser
@@ -9781,7 +9892,28 @@ function registerNodeFormListeners() {
 
     // 时记 send-mode toggle: re-render preview + persist.
     $(document).off('change', '#wizard-shiji-mode').on('change', '#wizard-shiji-mode', function () {
+        const prevMode = config.shijiMode;
         config.shijiMode = $(this).val() || 'uncovered';
+        $('#wizard-shiji-event-row').css('display', config.shijiMode === 'event' ? 'flex' : 'none');
+        if (swapShijiRuleSet(prevMode, config.shijiMode)) {
+            renderShijiRules();
+            toastr.info(config.shijiMode === 'event' ? '已切换到按事件模式的时记规则' : '已切换回普通模式的时记规则');
+        }
+        renderShijiList();
+        saveConfig(true);
+    });
+
+    // 按事件模式的 recap 正则：失焦保存；非法正则提示后回退到上次的有效值。
+    $(document).off('change', '#wizard-shiji-event-regex').on('change', '#wizard-shiji-event-regex', function () {
+        const val = String($(this).val() || '').trim();
+        if (val) {
+            try { new RegExp(val, 'g'); } catch (e) {
+                toastr.error(`recap 正则无效：${e.message}`);
+                $(this).val(config.shijiEventRegex || '');
+                return;
+            }
+        }
+        config.shijiEventRegex = val;
         renderShijiList();
         saveConfig(true);
     });
