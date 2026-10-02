@@ -1797,12 +1797,22 @@
                 <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 0.82em; color: #d1d5db;">
                     <i class="fa-solid fa-list-ol" style="color: var(--wizard-primary);"></i>
                     发送模式
-                    <span class="wizard-tooltip-icon wizard-tooltip-down" data-tooltip="未归类：从最新往前取「还没被任何日记/周记/史记覆盖」的连续楼层，遇到已归档即停（上限=时记上限条数）。固定：始终取最新 N 条楼层，不管是否已被归档。">?</span>
+                    <span class="wizard-tooltip-icon wizard-tooltip-down" data-tooltip="未归类：从最新往前取「还没被任何日记/周记/史记覆盖」的连续楼层，遇到已归档即停（上限=时记上限条数）。固定：始终取最新 N 条楼层，不管是否已被归档。按事件：AI 只在场景/地点/话题切换时写 recap——未归档楼层里带 recap 的 AI 楼只注入 recap（全部保留、不设上限）；最后一个 recap 之后的楼层注入全文（上限=时记上限条数）；更早的无 recap 楼层不再注入。">?</span>
                     <select class="wizard-select" id="wizard-shiji-mode"
                         style="flex: 1; min-width: 0; padding: 3px 6px; font-size: 0.9em; background: rgba(0,0,0,0.25);">
                         <option value="uncovered">仅发送未归类楼层（上限 N）</option>
                         <option value="fixed">固定发送最新 N 条楼层</option>
+                        <option value="event">按事件：全部 recap + 最后一个 recap 之后的全文（上限 N）</option>
                     </select>
+                </div>
+
+                <!-- 按事件：recap 识别正则 -->
+                <div id="wizard-shiji-event-row" style="display: none; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 0.82em; color: #d1d5db;">
+                    <i class="fa-solid fa-flag" style="color: var(--wizard-primary);"></i>
+                    recap 正则
+                    <span class="wizard-tooltip-icon wizard-tooltip-down" data-tooltip="用来识别 AI 楼里的事件 recap。有捕获组时只注入组 1（去掉标签）。recap 楼只注入 recap，不再经过下方时记规则；全文楼照常经过规则。正则为空或非法时退回「仅发送未归类楼层」。">?</span>
+                    <input type="text" class="wizard-input" id="wizard-shiji-event-regex" placeholder="<recap>([\s\S]*?)</recap>"
+                        style="flex: 1; min-width: 0; padding: 3px 6px; font-size: 0.9em; font-family: monospace; background: rgba(0,0,0,0.25);">
                 </div>
 
                 <!-- 始终保持X楼 -->
