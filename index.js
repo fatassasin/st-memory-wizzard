@@ -33,6 +33,281 @@ function getWizardHeaders() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// REGION: TauriTavern 后端适配（wizardFetch）
+// ══════════════════════════════════════════════════════════════════════
+// TauriTavern 没有 SillyTavern 的 Node 服务端插件，backend/index.mjs 跑不起来。
+// 所有后端请求都走 wizardFetch()：SillyTavern 下原样 fetch；TauriTavern 下把
+// /api/plugins/st-memory-wizzard/<端点> 和 wizzard.log 映射到
+// window.__TAURITAVERN__.api.extension.store，返回与 Node 后端同形的 Response，
+// 调用方无需区分环境。TauriTavern 适配最初由 gu (msjncdxcrt/st-memory-wizzard) 移植。
+const WIZARD_API_PREFIX = '/api/plugins/st-memory-wizzard/';
+const WIZARD_LOG_URL = '/scripts/extensions/third-party/st-memory-wizzard/wizzard.log';
+
+function isTauriTavern() {
+    return !!(window.__TAURITAVERN__ || window.__TAURITAVERN_MAIN_READY__);
+}
+
+async function wizardFetch(url, init = {}) {
+    if (!isTauriTavern() || typeof url !== 'string') return fetch(url, init);
+    if (url === WIZARD_LOG_URL) {
+        const text = await ttBackend.logText();
+        return new Response(text, { status: text ? 200 : 404, headers: { 'Content-Type': 'text/plain' } });
+    }
+    if (!url.startsWith(WIZARD_API_PREFIX)) return fetch(url, init);
+    const endpoint = url.slice(WIZARD_API_PREFIX.length);
+    let body = {};
+    try { body = init.body ? JSON.parse(init.body) : {}; } catch (_) { /* 非 JSON body 当作空 */ }
+    let status = 200, data;
+    try {
+        const handler = ttBackend.routes[endpoint];
+        if (handler) {
+            data = await handler(body);
+            if (data && data.__status) { status = data.__status; data = { error: data.error }; }
+        } else {
+            status = 404; data = { error: `TauriTavern 下不支持该端点：${endpoint}` };
+        }
+    } catch (e) {
+        console.error(`${LOG_PREFIX} TauriTavern store 请求失败 (${endpoint})`, e);
+        status = 500; data = { error: e?.message || String(e) };
+    }
+    return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
+}
+
+// TauriTavern 存储后端：镜像 backend/index.mjs 的端点语义与返回格式。
+// Store key 沿用 gu 移植版的命名（config / shared_tree / tree_<id> / sum_<id> /
+// sandbox_<id> / logs），已在其移植版里存下的数据可直接读到。
+// 与 Node 版的差异：没有 Backups/history 时间快照，备份列表只有当前数据。
+const ttBackend = (() => {
+    const NS = 'st-memory-wizzard';
+    const LOG_KEEP = 2000; // 日志最多保留的行数（Node 版按天清空 wizzard.log）
+    const safeId = (id) => String(id || '').replace(/[^a-z0-9_-]/gi, '_');
+    const fail = (status, error) => ({ __status: status, error });
+    const today = () => new Date().toISOString().slice(0, 10);
+
+    async function store() {
+        await (window.__TAURITAVERN__?.ready ?? window.__TAURITAVERN_MAIN_READY__);
+        const s = window.__TAURITAVERN__?.api?.extension?.store;
+        if (!s) throw new Error('TauriTavern extension.store 不可用');
+        return s;
+    }
+    async function read(key) {
+        const s = await store();
+        if (typeof s.tryGetJson === 'function') {
+            const r = await s.tryGetJson({ namespace: NS, key });
+            return r && r.found ? r.value : undefined;
+        }
+        try { return await s.getJson({ namespace: NS, key }); } catch (_) { return undefined; }
+    }
+    async function write(key, value) {
+        const s = await store();
+        await s.setJson({ namespace: NS, key, value });
+        return true;
+    }
+    async function keys() {
+        const s = await store();
+        const list = await s.listKeys({ namespace: NS });
+        return Array.isArray(list) ? list.map(k => (typeof k === 'string' ? k : k?.key)).filter(Boolean) : [];
+    }
+
+    // 与 backend/index.mjs 的 INITIAL_CATEGORIES / INITIAL_SHARED_TREE 保持一致。
+    const initialCategories = () => [
+        {
+            path: "身份核", title: "身份核", hint: "聊关于我的设定/身份时读我", pinned: true, content: "身份核心设定。", updated: today(),
+            children: [
+                { path: "身份核/当前进行中事项", title: "当前进行中事项", hint: "聊目前有什么任务/在做什么时读我", pinned: true, content: "当前进行中事项。", updated: today(), children: [] },
+                { path: "身份核/豁免三条", title: "豁免三条", hint: "我的行为规范/豁免条款", pinned: true, content: "豁免三条：不违反规则，保护设定，不背叛信赖。", updated: today(), children: [] }
+            ]
+        },
+        { path: "知识", title: "知识", hint: "聊具体概念/理论/事实时读我", pinned: false, content: "", updated: today(), children: [] },
+        { path: "关系与情感", title: "关系与情感", hint: "聊与你的经历/情感/好恶时读我", pinned: false, content: "", updated: today(), children: [] },
+        { path: "现实事件", title: "现实事件", hint: "聊现实新闻/天气/发生的具体事件时读我", pinned: false, content: "", updated: today(), children: [] },
+        { path: "项目", title: "项目", hint: "聊我们在协作的计划/写代码/做视频时读我", pinned: false, content: "", updated: today(), children: [] },
+        { path: "挂账", title: "挂账", hint: "聊还未完成的讨论/遗留账目/待办时读我", pinned: false, content: "", updated: today(), children: [] }
+    ];
+    const initialSharedTree = () => [
+        { path: "共有记忆", title: "共有记忆", hint: "所有角色共享的记忆，聊到跨角色通用的设定/事实时读我", pinned: true, shared: true, content: "", updated: today(), children: [] }
+    ];
+
+    // 备份类型 → store key 前缀，以及 Node 版文件名前缀（列表显示用 Node 风格的名字）。
+    const KINDS = {
+        tree: { key: 'tree_', file: 'memory_tree_' },
+        summaries: { key: 'sum_', file: 'summaries_' },
+        sandbox: { key: 'sandbox_', file: 'sandbox_chat_' },
+    };
+    const backupKey = (kind, name) => {
+        const k = KINDS[kind];
+        if (!k || typeof name !== 'string' || !name.startsWith(k.file) || !name.endsWith('.json')) return null;
+        return k.key + name.slice(k.file.length, -'.json'.length);
+    };
+    const approxSize = (v) => { try { return new Blob([JSON.stringify(v)]).size; } catch (_) { return 0; } };
+
+    // 日志：内存缓冲 + 防抖落盘，避免每条 writeLog 都整读整写一次 store。
+    let logLines = null;
+    let logSaveTimer = null;
+    async function loadLogLines() {
+        if (logLines) return logLines;
+        const saved = await read('logs').catch(() => undefined);
+        // gu 移植版存的是 { time, level, message } 对象数组，这里统一转成文本行。
+        logLines = Array.isArray(saved)
+            ? saved.map(l => (typeof l === 'string' ? l : `[${l?.time || ''}] [${l?.level || 'INFO'}] ${l?.message ?? ''}`))
+            : [];
+        return logLines;
+    }
+
+    // 与 backend/index.mjs 的 /backfill-realtime 同一算法（楼层号为 0 起的数组下标）。
+    function backfillRealtime(summaries, chat) {
+        const tsOf = (msg) => {
+            if (!msg) return NaN;
+            if (typeof msg.send_date === 'number') return msg.send_date;
+            const raw = msg.send_date || '';
+            if (!raw) return NaN;
+            let t = Date.parse(raw);
+            if (isNaN(t)) t = Date.parse(String(raw).replace(/(\d)\s*(am|pm)\b/i, '$1 $2'));
+            return isNaN(t) ? NaN : t;
+        };
+        const fmt = (ms) => {
+            const d = new Date(ms);
+            const p = (n) => String(n).padStart(2, '0');
+            return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+        };
+        const floorsOf = (item) => {
+            if (item && typeof item === 'object' && item.coveredFloors
+                && typeof item.coveredFloors.lo === 'number' && typeof item.coveredFloors.hi === 'number') {
+                return { lo: item.coveredFloors.lo, hi: item.coveredFloors.hi };
+            }
+            const src = (item && typeof item === 'object') ? (item.source || '') : '';
+            const m = String(src).match(/楼层\s*(\d+)\s*-\s*(\d+)/);
+            if (!m) return null;
+            const a = parseInt(m[1]), b = parseInt(m[2]);
+            if (isNaN(a) || isNaN(b)) return null;
+            return { lo: Math.min(a, b), hi: Math.max(a, b) };
+        };
+        const hasRealTs = (item) => item && typeof item === 'object' && typeof item.realTimespan === 'string' && item.realTimespan.trim();
+        let filled = 0, skippedNoFloors = 0, skippedNoTs = 0;
+        for (const key of ['recaps', 'weeklySummaries', 'historicalSummaries']) {
+            const arr = summaries[key];
+            if (!Array.isArray(arr)) continue;
+            for (let i = 0; i < arr.length; i++) {
+                let item = arr[i];
+                if (typeof item === 'string') item = { text: item };
+                if (hasRealTs(item)) continue;
+                const r = floorsOf(item);
+                if (!r) { skippedNoFloors++; arr[i] = item; continue; }
+                const tsList = [];
+                for (let f = r.lo; f <= r.hi && f < chat.length; f++) {
+                    const t = tsOf(chat[f]);
+                    if (!isNaN(t)) tsList.push(t);
+                }
+                if (!tsList.length) { skippedNoTs++; arr[i] = item; continue; }
+                const min = Math.min(...tsList), max = Math.max(...tsList);
+                item.realTimespan = (min === max) ? fmt(min) : `${fmt(min)} ~ ${fmt(max)}`;
+                item.coveredFloors = { lo: r.lo, hi: r.hi };
+                arr[i] = item;
+                filled++;
+            }
+        }
+        return { summaries, filled, skippedNoFloors, skippedNoTs, sandboxLen: chat.length };
+    }
+
+    const routes = {
+        'get-config': async () => (await read('config')) ?? {},
+        'save-config': async ({ config: c }) => ({ success: await write('config', c) }),
+        'get-tree': async ({ chatId }) => {
+            if (!chatId) return fail(400, 'Missing chatId');
+            return (await read(`tree_${safeId(chatId)}`)) ?? initialCategories();
+        },
+        'save-tree': async ({ chatId, tree }) => {
+            if (!chatId || !tree) return fail(400, 'Missing chatId or tree');
+            return { success: await write(`tree_${safeId(chatId)}`, tree) };
+        },
+        'get-shared-tree': async () => {
+            const tree = await read('shared_tree');
+            return Array.isArray(tree) ? tree : initialSharedTree();
+        },
+        'save-shared-tree': async ({ tree }) => {
+            if (!Array.isArray(tree)) return fail(400, 'Missing or invalid shared tree');
+            return { success: await write('shared_tree', tree) };
+        },
+        'get-summaries': async ({ chatId }) => {
+            if (!chatId) return fail(400, 'Missing chatId');
+            return (await read(`sum_${safeId(chatId)}`))
+                ?? { recaps: [], weeklySummaries: [], historicalSummaries: [], lastArchivedIndex: 0 };
+        },
+        'save-summaries': async ({ chatId, summaries }) => {
+            if (!chatId || !summaries) return fail(400, 'Missing chatId or summaries');
+            return { success: await write(`sum_${safeId(chatId)}`, summaries) };
+        },
+        'get-sandbox-chat': async ({ chatId }) => {
+            if (!chatId) return fail(400, 'Missing chatId');
+            return (await read(`sandbox_${safeId(chatId)}`)) ?? [];
+        },
+        'save-sandbox-chat': async ({ chatId, chat }) => {
+            if (!chatId || !chat) return fail(400, 'Missing chatId or chat');
+            return { success: await write(`sandbox_${safeId(chatId)}`, chat) };
+        },
+        // 只在目标 key 不存在时复制，绝不覆盖现有数据（同 Node 版）。
+        'migrate-key': async ({ fromChatId, toChatId }) => {
+            if (!fromChatId || !toChatId) return fail(400, 'Missing fromChatId or toChatId');
+            const from = safeId(fromChatId), to = safeId(toChatId);
+            if (from === to) return { migrated: false, reason: 'same-key' };
+            const copied = [];
+            for (const prefix of ['tree_', 'sum_', 'sandbox_']) {
+                const src = await read(prefix + from);
+                if (src === undefined || (await read(prefix + to)) !== undefined) continue;
+                await write(prefix + to, src);
+                copied.push(prefix + to);
+            }
+            return { migrated: copied.length > 0, copied };
+        },
+        'list-backups': async ({ kind }) => {
+            const k = KINDS[kind];
+            if (!k) return fail(400, 'Invalid kind (expected "tree" or "summaries")');
+            const backups = [];
+            for (const key of await keys()) {
+                if (!key.startsWith(k.key)) continue;
+                const value = await read(key);
+                backups.push({ name: `${k.file}${key.slice(k.key.length)}.json`, location: 'live', size: approxSize(value), mtime: Date.now() });
+            }
+            return { backups };
+        },
+        'read-backup': async ({ kind, name }) => {
+            const key = backupKey(kind, name);
+            if (!key) return fail(400, 'Invalid backup name');
+            const data = await read(key);
+            if (data === undefined) return fail(404, 'Backup not found');
+            return { name, data };
+        },
+        'backfill-realtime': async ({ summaries, sandboxName }) => {
+            if (!summaries || typeof summaries !== 'object') return fail(400, 'Missing summaries');
+            const key = backupKey('sandbox', sandboxName);
+            if (!key) return fail(400, 'Invalid sandbox name');
+            const chat = await read(key);
+            if (chat === undefined) return fail(404, 'Sandbox backup not found');
+            if (!Array.isArray(chat)) return fail(400, 'Sandbox backup is not a chat array');
+            return backfillRealtime(summaries, chat);
+        },
+        'log': async ({ message, level }) => {
+            const lines = await loadLogLines();
+            lines.push(`[${new Date().toISOString()}] [${level || 'INFO'}] ${message}`);
+            if (lines.length > LOG_KEEP) lines.splice(0, lines.length - LOG_KEEP);
+            clearTimeout(logSaveTimer);
+            logSaveTimer = setTimeout(() => { write('logs', lines).catch(() => {}); }, 2000);
+            return { success: true };
+        },
+        'gateway/start': async () => fail(501, 'TauriTavern 下扩展无法启动本地网关进程'),
+        'gateway/stop': async () => fail(501, 'TauriTavern 下扩展无法管理本地网关进程'),
+    };
+
+    return {
+        routes,
+        async logText() {
+            const lines = await loadLogLines().catch(() => []);
+            return lines.length ? lines.join('\n') + '\n' : '';
+        },
+    };
+})();
+
+// ══════════════════════════════════════════════════════════════════════
 // REGION: 配置与默认值（config 对象 + 内置默认 prompts / 常量）
 // ══════════════════════════════════════════════════════════════════════
 let config = {
@@ -337,6 +612,31 @@ Instructions:
 4. "archive": Move node out of the index list but keep on disk. There is no physical delete.
 5. PREFER an existing path from the reference tree for "insert.parent". But if NO existing category fits the new fact well, you MAY invent a new parent path — write the full slash-joined path you want (e.g. "知识/新分类"); any missing 母节点 (parent categories) will be created automatically. Do not force an unrelated fact under an ill-fitting existing parent just to avoid creating a new category.
 6. Output only JSON, do not include codeblock markers.`;
+}
+
+// 解析填树模型返回的 treeops JSON。先按原样解析，失败再逐级修复模型常见的格式问题：
+// JSON 前后的解释文字 / markdown 代码块、双花括号转义残留、尾随逗号、// 或 # 行注释。
+// 修复只在原样解析失败后才尝试，不会改动本来合法的 JSON。（移植自 gu 的 TauriTavern 版）
+function safeParseTreeOpsJson(raw) {
+    if (!raw || typeof raw !== 'string') {
+        throw new Error('Empty or non-string response from tree-fill model.');
+    }
+    let text = raw.replace(/```json/gi, '').replace(/```/g, '').trim();
+    const firstBrace = text.indexOf('{');
+    const lastBrace = text.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace > firstBrace) text = text.slice(firstBrace, lastBrace + 1);
+
+    const candidates = [text];
+    const push = (t) => { if (!candidates.includes(t)) candidates.push(t); };
+    if (text.startsWith('{{') && text.endsWith('}}')) push(text.slice(1, -1));
+    for (const t of [...candidates]) push(t.replace(/,(\s*[}\]])/g, '$1'));
+    for (const t of [...candidates]) push(t.replace(/^\s*(\/\/|#).*$/gm, ''));
+
+    let firstError = null;
+    for (const t of candidates) {
+        try { return JSON.parse(t); } catch (e) { firstError = firstError || e; }
+    }
+    throw firstError;
 }
 
 // Manual-fusion tree-fill instruction block (the <treeops> task appended after the
@@ -1587,7 +1887,7 @@ function applyMainPromptCacheControls(chat) {
 async function writeLog(message, level = 'INFO') {
     console.log(`${LOG_PREFIX} [${level}] ${message}`);
     try {
-        await fetch('/api/plugins/st-memory-wizzard/log', {
+        await wizardFetch('/api/plugins/st-memory-wizzard/log', {
             method: 'POST',
             headers: getWizardHeaders(),
             body: JSON.stringify({ message, level })
@@ -2518,7 +2818,7 @@ async function showBackupPicker(kind, metaOnly = false) {
     const context = window.SillyTavern.getContext();
     let backups = [];
     try {
-        const res = await fetch('/api/plugins/st-memory-wizzard/list-backups', {
+        const res = await wizardFetch('/api/plugins/st-memory-wizzard/list-backups', {
             method: 'POST',
             headers: getWizardHeaders(),
             body: JSON.stringify({ kind })
@@ -2575,7 +2875,7 @@ async function showBackupPicker(kind, metaOnly = false) {
     // Caller only needs the identity (e.g. server-side processing of a huge file).
     if (metaOnly) return { name: chosen.name, location: chosen.location };
     try {
-        const res = await fetch('/api/plugins/st-memory-wizzard/read-backup', {
+        const res = await wizardFetch('/api/plugins/st-memory-wizzard/read-backup', {
             method: 'POST',
             headers: getWizardHeaders(),
             body: JSON.stringify({ kind, name: chosen.name, location: chosen.location })
@@ -3102,7 +3402,7 @@ function deleteNodeFromTree(target) {
 async function fetchAndMergeSharedTree() {
     let sharedForest = [];
     try {
-        const res = await fetch('/api/plugins/st-memory-wizzard/get-shared-tree', {
+        const res = await wizardFetch('/api/plugins/st-memory-wizzard/get-shared-tree', {
             method: 'POST',
             headers: getWizardHeaders(),
             body: JSON.stringify({})
@@ -3138,7 +3438,7 @@ async function saveTreeToServer(skipNormalize = false) {
     const { personal, shared } = splitSharedFromTree(memoryTree);
     if (sharedTreeLoaded && !treeLoadInProgress) {
         try {
-            await fetch('/api/plugins/st-memory-wizzard/save-shared-tree', {
+            await wizardFetch('/api/plugins/st-memory-wizzard/save-shared-tree', {
                 method: 'POST',
                 headers: getWizardHeaders(),
                 body: JSON.stringify({ tree: shared })
@@ -3148,7 +3448,7 @@ async function saveTreeToServer(skipNormalize = false) {
         }
     }
     try {
-        const res = await fetch('/api/plugins/st-memory-wizzard/save-tree', {
+        const res = await wizardFetch('/api/plugins/st-memory-wizzard/save-tree', {
             method: 'POST',
             headers: getWizardHeaders(),
             body: JSON.stringify({ chatId: activeChatId, tree: personal })
@@ -4971,7 +5271,7 @@ async function loadConfig() {
     try {
         // Fetch config from backend
         try {
-            const res = await fetch('/api/plugins/st-memory-wizzard/get-config', {
+            const res = await wizardFetch('/api/plugins/st-memory-wizzard/get-config', {
                 method: 'POST',
                 headers: getWizardHeaders(),
                 body: JSON.stringify({})
@@ -5458,7 +5758,7 @@ async function saveConfig(silent = false) {
     $('#wizard-fusion-template-macro-label').text(`{{${config.macroFusion || 'memory'}}}`);
 
     try {
-        const res = await fetch('/api/plugins/st-memory-wizzard/save-config', {
+        const res = await wizardFetch('/api/plugins/st-memory-wizzard/save-config', {
             method: 'POST',
             headers: getWizardHeaders(),
             body: JSON.stringify({ config })
@@ -5492,7 +5792,7 @@ async function saveConfig(silent = false) {
 async function loadSummaries() {
     if (!activeChatId) return;
     try {
-        const res = await fetch('/api/plugins/st-memory-wizzard/get-summaries', {
+        const res = await wizardFetch('/api/plugins/st-memory-wizzard/get-summaries', {
             method: 'POST',
             headers: getWizardHeaders(),
             body: JSON.stringify({ chatId: activeChatId })
@@ -5911,7 +6211,7 @@ async function loadLogs() {
         // We know it is written to the extension storage directory which is served by ST as a static asset!
         // The URL path for files in extension folder is:
         // /scripts/extensions/third-party/st-memory-wizzard/wizzard.log
-        const res = await fetch('/scripts/extensions/third-party/st-memory-wizzard/wizzard.log');
+        const res = await wizardFetch(WIZARD_LOG_URL);
         const viewer = $('#wizard-log-viewer');
         if (res.ok) {
             const logsText = await res.text();
@@ -7166,8 +7466,7 @@ async function fillTreeFromRecord(instruction, sourceText, sourceFloor = null) {
 
     const userContent = `<record 指令>\n${instruction}\n</record 指令>\n\n来源正文（AI 本条回复）:\n${sourceText || '(空)'}`;
     const resp = await runProfileLlmCall(treeFillProfile, [{ role: 'user', content: userContent }], systemPrompt, 0.1);
-    const cleanJson = (resp || '').replace(/```json/gi, '').replace(/```/g, '').trim();
-    const opsResult = JSON.parse(cleanJson);
+    const opsResult = safeParseTreeOpsJson(resp);
     if (opsResult && Array.isArray(opsResult.ops) && opsResult.ops.length) {
         applyTreeOperations(opsResult.ops, treeSourceMetaForFloor(sourceFloor));
         await saveTreeToServer();
@@ -7204,21 +7503,28 @@ async function runTreeFillPipeline() {
     const treeHeader = (config.promptTreeFill || '').trim() || DEFAULT_TREEFILL_PROMPT;
     const treePrompt = `${treeHeader}${buildTreeFillTail()}`;
 
+    let treeFillSucceeded = false;
     try {
         const treeOpsResponse = await runProfileLlmCall(getProfileFor('treeFill'), [{ role: 'user', content: textContext }], treePrompt, 0.1);
-        const cleanJson = treeOpsResponse.replace(/```json/gi, '').replace(/```/g, '').trim();
-        const opsResult = JSON.parse(cleanJson);
+        const opsResult = safeParseTreeOpsJson(treeOpsResponse);
         if (opsResult && Array.isArray(opsResult.ops)) {
             applyTreeOperations(opsResult.ops);
             await saveTreeToServer();
+            treeFillSucceeded = true;
+        } else {
+            writeLog(`Tree-fill: model returned no ops array.`, 'WARNING');
         }
     } catch (e) {
         writeLog(`Tree-fill failed: ${e.message}`, 'WARNING');
     }
 
-    // Advance the tree-fill cursor to the end of what we just processed.
-    summaries.lastTreeFillIndex = endIndex + 1;
-    await saveSummariesToServer();
+    // 只有成功才推进填树光标；失败时停在原处，下一轮连同新楼层一起重试。
+    if (treeFillSucceeded) {
+        summaries.lastTreeFillIndex = endIndex + 1;
+        await saveSummariesToServer();
+    } else {
+        writeLog(`Tree-fill did not succeed; cursor stays at ${summaries.lastTreeFillIndex} for retry next turn.`);
+    }
 }
 
 // 队尾日记融合：把「队尾连续未覆盖段」(tailUncoveredRun) 融成一条日记。这是与 post-flash
@@ -7989,7 +8295,7 @@ async function fuseSummariesSelf(type, indices) {
 async function saveSummariesToServer() {
     if (!activeChatId) return;
     try {
-        await fetch('/api/plugins/st-memory-wizzard/save-summaries', {
+        await wizardFetch('/api/plugins/st-memory-wizzard/save-summaries', {
             method: 'POST',
             headers: getWizardHeaders(),
             body: JSON.stringify({ chatId: activeChatId, summaries })
@@ -8004,7 +8310,7 @@ async function saveSummariesToServer() {
 async function saveSandboxChatToServer() {
     if (!activeChatId) return;
     try {
-        await fetch('/api/plugins/st-memory-wizzard/save-sandbox-chat', {
+        await wizardFetch('/api/plugins/st-memory-wizzard/save-sandbox-chat', {
             method: 'POST',
             headers: getWizardHeaders(),
             body: JSON.stringify({ chatId: activeChatId, chat: sandboxChatContext })
@@ -8018,7 +8324,7 @@ async function saveSandboxChatToServer() {
 async function loadSandboxChatFromServer() {
     if (!activeChatId) return;
     try {
-        const res = await fetch('/api/plugins/st-memory-wizzard/get-sandbox-chat', {
+        const res = await wizardFetch('/api/plugins/st-memory-wizzard/get-sandbox-chat', {
             method: 'POST',
             headers: getWizardHeaders(),
             body: JSON.stringify({ chatId: activeChatId })
@@ -10042,7 +10348,7 @@ function registerNodeFormListeners() {
             $btn.prop('disabled', true).css('opacity', '0.65');
             toastr.info('本地网关未运行，正在启动…');
             try {
-                const r = await fetch('/api/plugins/st-memory-wizzard/gateway/start', { method: 'POST', headers: getWizardHeaders() });
+                const r = await wizardFetch('/api/plugins/st-memory-wizzard/gateway/start', { method: 'POST', headers: getWizardHeaders() });
                 const j = await r.json().catch(() => ({}));
                 if (j.ok) {
                     healthy = true;
@@ -14472,7 +14778,7 @@ function registerNodeFormListeners() {
         const origHtml = $btn.html();
         $btn.html('<i class="fa-solid fa-spinner fa-spin"></i> 回填中…');
         try {
-            const res = await fetch('/api/plugins/st-memory-wizzard/backfill-realtime', {
+            const res = await wizardFetch('/api/plugins/st-memory-wizzard/backfill-realtime', {
                 method: 'POST',
                 headers: getWizardHeaders(),
                 body: JSON.stringify({ summaries, sandboxName: picked.name, sandboxLocation: picked.location })
@@ -15319,7 +15625,7 @@ function registerNodeFormListeners() {
 async function checkBackendConnection() {
     const statusEl = $('#wizard-status-connection');
     try {
-        const res = await fetch('/api/plugins/st-memory-wizzard/get-config', {
+        const res = await wizardFetch('/api/plugins/st-memory-wizzard/get-config', {
             method: 'POST',
             headers: getWizardHeaders(),
             body: JSON.stringify({})
@@ -15566,7 +15872,7 @@ async function onChatChanged() {
         const legacyChatId = context?.chatId || "";
         if (legacyChatId && legacyChatId !== newChatId) {
             try {
-                await fetch('/api/plugins/st-memory-wizzard/migrate-key', {
+                await wizardFetch('/api/plugins/st-memory-wizzard/migrate-key', {
                     method: 'POST',
                     headers: getWizardHeaders(),
                     body: JSON.stringify({ fromChatId: legacyChatId, toChatId: newChatId })
@@ -15597,7 +15903,7 @@ async function onChatChanged() {
         // Fetch tree from server
         treeLoadInProgress = true; // any saveTreeToServer() below must not touch the shared doc yet
         try {
-            const res = await fetch('/api/plugins/st-memory-wizzard/get-tree', {
+            const res = await wizardFetch('/api/plugins/st-memory-wizzard/get-tree', {
                 method: 'POST',
                 headers: getWizardHeaders(),
                 body: JSON.stringify({ chatId: activeChatId })

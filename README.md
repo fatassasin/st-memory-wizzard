@@ -98,6 +98,25 @@ Memory Wizard（记忆之术）是一个 SillyTavern 第三方扩展，为角色
 
 > **注意**：本扩展的后台持久化（保存记忆树/摘要/日志等）完全依赖服务端插件能力。若没有正确安装在 `plugins/st-memory-wizzard` 下，所有的网络请求都会报 404 连接异常。
 
+### TauriTavern
+
+[TauriTavern](https://github.com/Darkatse/TauriTavern) 没有 Node 服务端插件，**不需要也无法安装 `backend/index.mjs`**。扩展会自动识别 TauriTavern 环境，改用它自带的扩展存储（`window.__TAURITAVERN__.api.extension.store`）保存配置、记忆树、摘要、沙盒和日志，前端功能与 SillyTavern 版一致。
+
+1. 把本仓库整个文件夹放到 TauriTavern 数据目录下的扩展目录（目录名保持 `st-memory-wizzard`）：
+   ```
+   data/default-user/extensions/st-memory-wizzard/
+   ```
+2. 重启 TauriTavern，在顶栏点击 🧠 图标打开面板。
+
+与 SillyTavern 版的差异：
+
+- 数据存在 `data_root/_tauritavern/extension-store/st-memory-wizzard/`，不写 `Backups/*.json`；两边的数据不互通。
+- 没有 `Backups/history` 时间快照，「导入备份」只能选当前数据。
+- 日志保留最近 2000 行，不按天清空。
+- 面板里的「打开网关」无法自动启动本地网关，需要先手动运行 `gateway/start-gateway.bat`。
+
+> TauriTavern 适配最初由 [gu (msjncdxcrt)](https://github.com/msjncdxcrt/st-memory-wizzard) 移植。
+
 ---
 
 ## 快速开始
